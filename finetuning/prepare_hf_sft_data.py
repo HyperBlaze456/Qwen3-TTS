@@ -22,8 +22,20 @@ except Exception as exc:
     ) from exc
 
 
+_LOG_FILE = None
+
+
+def _init_log_file(path: str) -> None:
+    global _LOG_FILE
+    if path:
+        _LOG_FILE = open(path, "a", encoding="utf-8")
+
+
 def _log_progress(msg: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    print(line, file=sys.stderr, flush=True)
+    if _LOG_FILE:
+        print(line, file=_LOG_FILE, flush=True)
 
 TAG_RE = re.compile(r"<[^>]*>")
 BRACE_RE = re.compile(r"\{[^}]*\}")
@@ -301,13 +313,17 @@ def main() -> None:
     parser.add_argument("--max_per_dataset", type=int, default=None)
     parser.add_argument("--with_audio_codes", action="store_true")
     parser.add_argument("--tokenizer_model_path", type=str, default="Qwen/Qwen3-TTS-Tokenizer-12Hz")
-    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--batch_size", type=int, default=BATCH_INFER_NUM)
     parser.add_argument("--no_arknights_download", action="store_true")
     parser.add_argument("--genshin_split", type=str, default="train")
     parser.add_argument("--starrail_split", type=str, default="train")
     parser.add_argument("--arknights_split", type=str, default="train")
+    parser.add_argument("--log_file", type=str, default=None, help="Path to log file (appends)")
     args = parser.parse_args()
+
+    if args.log_file:
+        _init_log_file(args.log_file)
 
     _log_progress("=" * 50)
     _log_progress("Starting HF SFT data preparation")

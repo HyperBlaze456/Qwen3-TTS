@@ -168,12 +168,23 @@ def _iter_simon_dataset(
     cache_dir: Optional[str],
     max_rows: Optional[int],
 ) -> Iterable[Dict]:
-    ds = load_dataset(dataset_name, split=split, cache_dir=cache_dir)
+    ds = load_dataset(dataset_name, split=split, streaming=True, cache_dir=cache_dir)
     if "audio" in ds.features:
         try:
             ds = ds.cast_column("audio", Audio(decode=False))
         except Exception:
             pass
+
+    def _row_filter(row: Dict) -> bool:
+        text = row.get("transcription")
+        if not text or not str(text).strip():
+            return False
+        if not allowed_langs:
+            return True
+        lang = _extract_lang(row)
+        return lang is not None and lang in allowed_langs
+
+    ds = ds.filter(_row_filter)
     for idx, row in enumerate(ds):
         if max_rows is not None and idx >= max_rows:
             break
@@ -181,8 +192,6 @@ def _iter_simon_dataset(
         if not text:
             continue
         lang = _extract_lang(row)
-        if allowed_langs and (lang is None or lang not in allowed_langs):
-            continue
         dataset_short = dataset_name.split("/")[-1]
         audio_bytes, audio_path = _audio_obj_to_bytes_and_path(row.get("audio"), dataset_short, idx)
         if audio_bytes is None and (audio_path is None or not os.path.isfile(audio_path)):

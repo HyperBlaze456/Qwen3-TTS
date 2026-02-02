@@ -5,6 +5,7 @@ import re
 import sys
 import tempfile
 import time
+import traceback
 import urllib.parse
 import urllib.request
 from typing import Dict, Iterable, Optional, Set, Tuple
@@ -21,8 +22,6 @@ except Exception as exc:
         "Missing dependency: datasets. Please install it first, `pip install datasets`."
     ) from exc
 
-
-import traceback
 
 _LOG_FILE = None
 

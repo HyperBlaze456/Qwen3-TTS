@@ -10,6 +10,8 @@ import urllib.parse
 import urllib.request
 from typing import Dict, Iterable, Optional, Set, Tuple
 
+import torch
+
 try:
     from tqdm import tqdm
 except ImportError:
@@ -441,8 +443,11 @@ def main() -> None:
                     if args.with_audio_codes:
                         _log_progress(f"Encoding batch {batch_count} ({len(batch_items)} samples)...")
                         enc = tokenizer.encode(batch_paths)
-                        for code, row in zip(enc.audio_codes, batch_items):
-                            yield _build_output_row(row, code.cpu().tolist(), args.schema)
+                        codes_list = [code.cpu().tolist() for code in enc.audio_codes]
+                        del enc
+                        torch.cuda.empty_cache()
+                        for code, row in zip(codes_list, batch_items):
+                            yield _build_output_row(row, code, args.schema)
                             total_yielded += 1
                     else:
                         for row in batch_items:
@@ -463,8 +468,11 @@ def main() -> None:
                 _log_progress(f"Processing final batch {batch_count} ({len(batch_items)} samples)...")
                 if args.with_audio_codes:
                     enc = tokenizer.encode(batch_paths)
-                    for code, row in zip(enc.audio_codes, batch_items):
-                        yield _build_output_row(row, code.cpu().tolist(), args.schema)
+                    codes_list = [code.cpu().tolist() for code in enc.audio_codes]
+                    del enc
+                    torch.cuda.empty_cache()
+                    for code, row in zip(codes_list, batch_items):
+                        yield _build_output_row(row, code, args.schema)
                         total_yielded += 1
                 else:
                     for row in batch_items:

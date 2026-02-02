@@ -398,7 +398,10 @@ def main() -> None:
             args.tokenizer_model_path,
             device_map=args.device,
         )
-        _log_progress("Tokenizer loaded successfully.")
+        # Disable KV caching in encoder transformer - not needed for encoding
+        # and causes massive memory accumulation via DynamicCache
+        tokenizer.model.encoder.config.use_cache = False
+        _log_progress("Tokenizer loaded successfully (encoder cache disabled).")
     else:
         _log_progress("Skipping tokenizer loading (--with_audio_codes not set)")
 
@@ -447,9 +450,14 @@ def main() -> None:
                     rows = []
                     if args.with_audio_codes:
                         _log_progress(f"Encoding batch {batch_count} ({len(batch_items)} samples)...")
-                        enc = tokenizer.encode(batch_paths)
-                        codes_list = [code.cpu().tolist() for code in enc.audio_codes]
+                        with torch.no_grad():
+                            enc = tokenizer.encode(batch_paths)
+                            codes_list = []
+                            for code in enc.audio_codes:
+                                codes_list.append(code.cpu().tolist())
+                            del enc.audio_codes
                         del enc
+                        torch.cuda.synchronize()
                         torch.cuda.empty_cache()
                         for code, row in zip(codes_list, batch_items):
                             rows.append(_build_output_row(row, code, args.schema))

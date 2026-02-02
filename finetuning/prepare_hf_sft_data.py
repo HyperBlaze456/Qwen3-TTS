@@ -4,9 +4,15 @@ import os
 import re
 import sys
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 from typing import Dict, Iterable, Optional, Set, Tuple
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 try:
     from datasets import Audio, load_dataset
@@ -14,6 +20,10 @@ except Exception as exc:
     raise SystemExit(
         "Missing dependency: datasets. Please install it first, `pip install datasets`."
     ) from exc
+
+
+def _log_progress(msg: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
 TAG_RE = re.compile(r"<[^>]*>")
 BRACE_RE = re.compile(r"\{[^}]*\}")
@@ -168,6 +178,7 @@ def _iter_simon_dataset(
     cache_dir: Optional[str],
     max_rows: Optional[int],
 ) -> Iterable[Dict]:
+    _log_progress(f"Loading dataset: {dataset_name} (split={split}, streaming=True)")
     ds = load_dataset(dataset_name, split=split, streaming=True, cache_dir=cache_dir)
     if "audio" in ds.features:
         try:
@@ -185,14 +196,17 @@ def _iter_simon_dataset(
         return lang is not None and lang in allowed_langs
 
     ds = ds.filter(_row_filter)
+    dataset_short = dataset_name.split("/")[-1]
+    _log_progress(f"Starting iteration over {dataset_short}...")
+    yielded = 0
     for idx, row in enumerate(ds):
         if max_rows is not None and idx >= max_rows:
+            _log_progress(f"[{dataset_short}] Reached max_rows limit ({max_rows})")
             break
         text = _clean_dialog_text(row.get("transcription"))
         if not text:
             continue
         lang = _extract_lang(row)
-        dataset_short = dataset_name.split("/")[-1]
         audio_bytes, audio_path = _audio_obj_to_bytes_and_path(row.get("audio"), dataset_short, idx)
         if audio_bytes is None and (audio_path is None or not os.path.isfile(audio_path)):
             continue
@@ -208,7 +222,11 @@ def _iter_simon_dataset(
         }
         if lang:
             item["language"] = lang
+        yielded += 1
+        if yielded % 500 == 0:
+            _log_progress(f"[{dataset_short}] Yielded {yielded} samples (iter idx={idx})")
         yield item
+    _log_progress(f"[{dataset_short}] Finished. Total yielded: {yielded}")
 
 
 def _iter_arknights_dataset(
@@ -219,18 +237,27 @@ def _iter_arknights_dataset(
     download_audio: bool,
     max_rows: Optional[int],
 ) -> Iterable[Dict]:
+    _log_progress(f"Loading dataset: {dataset_name} (split={split})")
     ds = load_dataset(dataset_name, split=split, cache_dir=cache_dir)
+    total_rows = len(ds)
+    _log_progress(f"[arknights] Total rows in dataset: {total_rows}")
+    yielded = 0
+    skipped = 0
     for idx, row in enumerate(ds):
         if max_rows is not None and idx >= max_rows:
+            _log_progress(f"[arknights] Reached max_rows limit ({max_rows})")
             break
         text = row.get("voice_text")
         if not text:
+            skipped += 1
             continue
         text = " ".join(str(text).split()).strip()
         if not text:
+            skipped += 1
             continue
         file_url = row.get("file_url")
         if not file_url:
+            skipped += 1
             continue
         audio_path = file_url
         if download_audio and audio_dir:
@@ -239,10 +266,12 @@ def _iter_arknights_dataset(
             out_path = os.path.join(audio_dir, "arknights", f"{idx}_{basename}")
             downloaded = _download_url(file_url, out_path)
             if not downloaded:
+                skipped += 1
                 continue
             audio_path = downloaded
         audio_bytes = _read_bytes(audio_path) if os.path.isfile(audio_path) else None
         if audio_bytes is None:
+            skipped += 1
             continue
         audio_value = {"bytes": audio_bytes, "path": audio_path}
         speaker = row.get("char_id")
@@ -255,7 +284,11 @@ def _iter_arknights_dataset(
             "language": "korean",
             "speaker": speaker,
         }
+        yielded += 1
+        if yielded % 500 == 0:
+            _log_progress(f"[arknights] Yielded {yielded} / processed {idx+1}/{total_rows} (skipped {skipped})")
         yield item
+    _log_progress(f"[arknights] Finished. Total yielded: {yielded}, skipped: {skipped}")
 
 
 def main() -> None:
@@ -276,6 +309,15 @@ def main() -> None:
     parser.add_argument("--arknights_split", type=str, default="train")
     args = parser.parse_args()
 
+    _log_progress("=" * 50)
+    _log_progress("Starting HF SFT data preparation")
+    _log_progress(f"  Output: {args.output_parquet}")
+    _log_progress(f"  Languages: {args.languages}")
+    _log_progress(f"  Max per dataset: {args.max_per_dataset}")
+    _log_progress(f"  With audio codes: {args.with_audio_codes}")
+    _log_progress(f"  Batch size: {args.batch_size}")
+    _log_progress("=" * 50)
+
     allowed_langs = {
         _normalize_lang(x) for x in args.languages.split(",") if x.strip()
     }
@@ -287,7 +329,9 @@ def main() -> None:
     ]
 
     def item_iter():
+        _log_progress(f"Processing {len(datasets)} simon datasets + arknights")
         for name, split in datasets:
+            _log_progress(f"--- Starting dataset: {name} ---")
             for item in _iter_simon_dataset(
                 name,
                 split,
@@ -296,7 +340,9 @@ def main() -> None:
                 args.max_per_dataset,
             ):
                 yield item
+            _log_progress(f"--- Completed dataset: {name} ---")
 
+        _log_progress("--- Starting dataset: arknights ---")
         for item in _iter_arknights_dataset(
             "deepghs/arknights_voices_kr",
             args.arknights_split,
@@ -306,9 +352,11 @@ def main() -> None:
             args.max_per_dataset,
         ):
             yield item
+        _log_progress("--- Completed dataset: arknights ---")
 
     tokenizer = None
     if args.with_audio_codes:
+        _log_progress(f"Loading tokenizer from {args.tokenizer_model_path}...")
         try:
             from qwen_tts import Qwen3TTSTokenizer
         except Exception as exc:
@@ -319,6 +367,9 @@ def main() -> None:
             args.tokenizer_model_path,
             device_map=args.device,
         )
+        _log_progress("Tokenizer loaded successfully.")
+    else:
+        _log_progress("Skipping tokenizer loading (--with_audio_codes not set)")
 
     try:
         from datasets import Dataset
@@ -333,6 +384,9 @@ def main() -> None:
             batch_items = []
             batch_paths = []
             temp_paths = []
+            total_yielded = 0
+            batch_count = 0
+            _log_progress("Starting parquet row generation...")
             for item in item_iter():
                 audio_value = item.get("audio")
                 if not isinstance(audio_value, dict):
@@ -354,13 +408,18 @@ def main() -> None:
                 batch_paths.append(encode_path)
 
                 if len(batch_items) >= args.batch_size:
+                    batch_count += 1
                     if args.with_audio_codes:
+                        _log_progress(f"Encoding batch {batch_count} ({len(batch_items)} samples)...")
                         enc = tokenizer.encode(batch_paths)
                         for code, row in zip(enc.audio_codes, batch_items):
                             yield _build_output_row(row, code.cpu().tolist(), args.schema)
+                            total_yielded += 1
                     else:
                         for row in batch_items:
                             yield _build_output_row(row, None, args.schema)
+                            total_yielded += 1
+                    _log_progress(f"Batch {batch_count} done. Total rows written: {total_yielded}")
                     batch_items.clear()
                     batch_paths.clear()
                     for p in temp_paths:
@@ -371,26 +430,34 @@ def main() -> None:
                     temp_paths.clear()
 
             if batch_items:
+                batch_count += 1
+                _log_progress(f"Processing final batch {batch_count} ({len(batch_items)} samples)...")
                 if args.with_audio_codes:
                     enc = tokenizer.encode(batch_paths)
                     for code, row in zip(enc.audio_codes, batch_items):
                         yield _build_output_row(row, code.cpu().tolist(), args.schema)
+                        total_yielded += 1
                 else:
                     for row in batch_items:
                         yield _build_output_row(row, None, args.schema)
+                        total_yielded += 1
                 for p in temp_paths:
                     try:
                         os.remove(p)
                     except Exception:
                         pass
+            _log_progress(f"Parquet generation complete. Total batches: {batch_count}, Total rows: {total_yielded}")
         finally:
             tmp_dir.cleanup()
 
     _ensure_dir(os.path.dirname(args.output_parquet) or ".")
+    _log_progress("Building dataset from generator (this may take a while)...")
     ds = Dataset.from_generator(_parquet_rows, cache_dir=args.cache_dir)
+    _log_progress(f"Dataset built with {len(ds)} samples. Casting audio column...")
     ds = ds.cast_column("audio", Audio(decode=False))
+    _log_progress(f"Writing to parquet: {args.output_parquet}")
     ds.to_parquet(args.output_parquet)
-    print(f"Wrote {len(ds)} samples to {args.output_parquet}")
+    _log_progress(f"Done! Wrote {len(ds)} samples to {args.output_parquet}")
 
 
 if __name__ == "__main__":

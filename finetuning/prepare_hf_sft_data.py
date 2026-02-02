@@ -22,6 +22,8 @@ except Exception as exc:
     ) from exc
 
 
+import traceback
+
 _LOG_FILE = None
 
 
@@ -29,6 +31,7 @@ def _init_log_file(path: str) -> None:
     global _LOG_FILE
     if path:
         _LOG_FILE = open(path, "a", encoding="utf-8")
+        _install_excepthook()
 
 
 def _log_progress(msg: str) -> None:
@@ -36,6 +39,17 @@ def _log_progress(msg: str) -> None:
     print(line, file=sys.stderr, flush=True)
     if _LOG_FILE:
         print(line, file=_LOG_FILE, flush=True)
+
+
+def _log_exception(exc_type, exc_value, exc_tb) -> None:
+    tb_lines = traceback.format_exception(exc_type, exc_value, exc_tb)
+    tb_str = "".join(tb_lines)
+    _log_progress(f"EXCEPTION:\n{tb_str}")
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+
+def _install_excepthook() -> None:
+    sys.excepthook = _log_exception
 
 TAG_RE = re.compile(r"<[^>]*>")
 BRACE_RE = re.compile(r"\{[^}]*\}")

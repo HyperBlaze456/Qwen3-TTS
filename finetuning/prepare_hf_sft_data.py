@@ -403,21 +403,25 @@ def main() -> None:
         _log_progress("Skipping tokenizer loading (--with_audio_codes not set)")
 
     try:
-        from datasets import Dataset
+        import pyarrow as pa
+        import pyarrow.parquet as pq
     except Exception as exc:
         raise SystemExit(
-            "Missing dependency: datasets. Please install it first, `pip install datasets`."
+            "Missing dependency: pyarrow. Please install it first, `pip install pyarrow`."
         ) from exc
 
-    def _parquet_rows():
+    def _process_and_write_streaming():
         tmp_dir = tempfile.TemporaryDirectory()
+        writer = None
+        total_yielded = 0
+        batch_count = 0
+
         try:
             batch_items = []
             batch_paths = []
             temp_paths = []
-            total_yielded = 0
-            batch_count = 0
-            _log_progress("Starting parquet row generation...")
+            _log_progress("Starting streaming parquet generation...")
+
             for item in item_iter():
                 audio_value = item.get("audio")
                 if not isinstance(audio_value, dict):
@@ -440,6 +444,7 @@ def main() -> None:
 
                 if len(batch_items) >= args.batch_size:
                     batch_count += 1
+                    rows = []
                     if args.with_audio_codes:
                         _log_progress(f"Encoding batch {batch_count} ({len(batch_items)} samples)...")
                         enc = tokenizer.encode(batch_paths)
@@ -447,13 +452,22 @@ def main() -> None:
                         del enc
                         torch.cuda.empty_cache()
                         for code, row in zip(codes_list, batch_items):
-                            yield _build_output_row(row, code, args.schema)
-                            total_yielded += 1
+                            rows.append(_build_output_row(row, code, args.schema))
                     else:
                         for row in batch_items:
-                            yield _build_output_row(row, None, args.schema)
-                            total_yielded += 1
+                            rows.append(_build_output_row(row, None, args.schema))
+
+                    # Write batch to parquet
+                    table = pa.Table.from_pylist(rows)
+                    if writer is None:
+                        _ensure_dir(os.path.dirname(args.output_parquet) or ".")
+                        writer = pq.ParquetWriter(args.output_parquet, table.schema)
+                    writer.write_table(table)
+                    total_yielded += len(rows)
                     _log_progress(f"Batch {batch_count} done. Total rows written: {total_yielded}")
+
+                    # Clear memory
+                    del rows, table
                     batch_items.clear()
                     batch_paths.clear()
                     for p in temp_paths:
@@ -463,8 +477,10 @@ def main() -> None:
                             pass
                     temp_paths.clear()
 
+            # Process remaining items
             if batch_items:
                 batch_count += 1
+                rows = []
                 _log_progress(f"Processing final batch {batch_count} ({len(batch_items)} samples)...")
                 if args.with_audio_codes:
                     enc = tokenizer.encode(batch_paths)
@@ -472,29 +488,35 @@ def main() -> None:
                     del enc
                     torch.cuda.empty_cache()
                     for code, row in zip(codes_list, batch_items):
-                        yield _build_output_row(row, code, args.schema)
-                        total_yielded += 1
+                        rows.append(_build_output_row(row, code, args.schema))
                 else:
                     for row in batch_items:
-                        yield _build_output_row(row, None, args.schema)
-                        total_yielded += 1
+                        rows.append(_build_output_row(row, None, args.schema))
+
+                table = pa.Table.from_pylist(rows)
+                if writer is None:
+                    _ensure_dir(os.path.dirname(args.output_parquet) or ".")
+                    writer = pq.ParquetWriter(args.output_parquet, table.schema)
+                writer.write_table(table)
+                total_yielded += len(rows)
+
                 for p in temp_paths:
                     try:
                         os.remove(p)
                     except Exception:
                         pass
+
             _log_progress(f"Parquet generation complete. Total batches: {batch_count}, Total rows: {total_yielded}")
         finally:
+            if writer is not None:
+                writer.close()
             tmp_dir.cleanup()
 
-    _ensure_dir(os.path.dirname(args.output_parquet) or ".")
-    _log_progress("Building dataset from generator (this may take a while)...")
-    ds = Dataset.from_generator(_parquet_rows, cache_dir=args.cache_dir)
-    _log_progress(f"Dataset built with {len(ds)} samples. Casting audio column...")
-    ds = ds.cast_column("audio", Audio(decode=False))
-    _log_progress(f"Writing to parquet: {args.output_parquet}")
-    ds.to_parquet(args.output_parquet)
-    _log_progress(f"Done! Wrote {len(ds)} samples to {args.output_parquet}")
+        return total_yielded
+
+    _log_progress("Starting streaming write to parquet...")
+    total_samples = _process_and_write_streaming()
+    _log_progress(f"Done! Wrote {total_samples} samples to {args.output_parquet}")
 
 
 if __name__ == "__main__":

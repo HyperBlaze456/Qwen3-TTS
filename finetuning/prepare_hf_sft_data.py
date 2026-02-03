@@ -1,6 +1,7 @@
 import argparse
 import gc
 import io
+import json
 import os
 import re
 import sys
@@ -55,6 +56,7 @@ def _install_excepthook() -> None:
 
 TAG_RE = re.compile(r"<[^>]*>")
 BRACE_RE = re.compile(r"\{[^}]*\}")
+PART_RE = re.compile(r"^part-(\d+)\.parquet$")
 BATCH_INFER_NUM = 32
 
 
@@ -118,6 +120,53 @@ def _get_parquet_row_count(path: str) -> int:
     except Exception as exc:
         _log_progress(f"[warn] Failed to read parquet metadata: {exc}")
         return 0
+
+
+def _load_json(path: str) -> Optional[Dict]:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as exc:
+        _log_progress(f"[warn] Failed to read resume state: {exc}")
+        return None
+
+
+def _write_json_atomic(path: str, payload: Dict) -> None:
+    if not path:
+        return
+    tmp_path = f"{path}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        _log_progress(f"[warn] Failed to write resume state: {exc}")
+
+
+def _resolve_output_mode(output_path: str, output_mode: str) -> str:
+    if output_mode != "auto":
+        return output_mode
+    if output_path.endswith(os.sep) or os.path.isdir(output_path):
+        return "dataset"
+    return "file"
+
+
+def _scan_parquet_dir(output_dir: str) -> Tuple[Tuple[str, ...], int]:
+    if not output_dir or not os.path.isdir(output_dir):
+        return tuple(), 0
+    parquet_files = []
+    max_part = -1
+    for name in os.listdir(output_dir):
+        match = PART_RE.match(name)
+        if not match:
+            continue
+        parquet_files.append(name)
+        max_part = max(max_part, int(match.group(1)))
+    parquet_files.sort()
+    next_part = max_part + 1 if max_part >= 0 else len(parquet_files)
+    return tuple(os.path.join(output_dir, name) for name in parquet_files), next_part
 
 
 def _normalize_lang(value: Optional[str]) -> Optional[str]:
@@ -221,6 +270,46 @@ def _audio_obj_to_bytes_and_path(
         return wav_bytes, f"{dataset_short}_{idx}.wav"
     except Exception:
         return None, None
+
+
+def _merge_parquet_shards(part_files: Tuple[str, ...], output_path: str) -> int:
+    if not part_files:
+        _log_progress("[warn] No parquet shards found to merge.")
+        return 0
+    try:
+        import pyarrow.parquet as pq
+    except Exception as exc:
+        raise SystemExit(
+            "Missing dependency: pyarrow. Please install it first, `pip install pyarrow`."
+        ) from exc
+
+    part_files = tuple(sorted(part_files))
+    _ensure_dir(os.path.dirname(output_path) or ".")
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".parquet", dir=os.path.dirname(output_path) or ".")
+    os.close(tmp_fd)
+    total_rows = 0
+    writer = None
+    try:
+        schema = pq.read_schema(part_files[0])
+        writer = pq.ParquetWriter(tmp_path, schema)
+        for path in part_files:
+            parquet_file = pq.ParquetFile(path)
+            for i in range(parquet_file.num_row_groups):
+                table = parquet_file.read_row_group(i)
+                writer.write_table(table)
+                total_rows += table.num_rows
+        writer.close()
+        writer = None
+        os.replace(tmp_path, output_path)
+    finally:
+        if writer is not None:
+            writer.close()
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+    return total_rows
 
 
 def _write_temp_audio(audio_bytes: bytes, path_hint: Optional[str], tmp_dir: str) -> str:
@@ -384,6 +473,26 @@ def _iter_arknights_dataset(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_parquet", type=str, required=True)
+    parser.add_argument(
+        "--output_mode",
+        type=str,
+        choices=("auto", "file", "dataset"),
+        default="auto",
+        help=(
+            "Output mode: file writes a single parquet (resume rewrites), "
+            "dataset writes sharded parquet files in a directory for true resume, "
+            "auto uses dataset if output_parquet is a directory."
+        ),
+    )
+    parser.add_argument(
+        "--merge_output_parquet",
+        type=str,
+        default=None,
+        help=(
+            "If set and output_mode=dataset, merge all part-*.parquet shards into a single "
+            "parquet at this path after processing completes."
+        ),
+    )
     parser.add_argument("--schema", type=str, choices=("train", "minimal"), default="train")
     parser.add_argument("--languages", type=str, default="Japanese,Korean")
     parser.add_argument("--cache_dir", type=str, default=None)
@@ -423,6 +532,9 @@ def main() -> None:
     _log_progress("=" * 50)
     _log_progress("Starting HF SFT data preparation")
     _log_progress(f"  Output: {args.output_parquet}")
+    _log_progress(f"  Output mode: {args.output_mode}")
+    if args.merge_output_parquet:
+        _log_progress(f"  Merge output parquet: {args.merge_output_parquet}")
     _log_progress(f"  Languages: {args.languages}")
     _log_progress(f"  Max per dataset: {args.max_per_dataset}")
     _log_progress(f"  With audio codes: {args.with_audio_codes}")
@@ -553,30 +665,131 @@ def main() -> None:
     def _process_and_write_streaming():
         tmp_dir = tempfile.TemporaryDirectory()
         writer = None
+        tmp_output_path = None
 
-        # Resume from existing parquet file row count (read metadata only, not full file)
+        output_mode = _resolve_output_mode(args.output_parquet, args.output_mode)
+        output_path = args.output_parquet
+        output_dir = args.output_parquet
+        merge_output_path = args.merge_output_parquet
+        state_path = (
+            f"{output_path}.resume.json"
+            if output_mode == "file"
+            else os.path.join(output_dir, "_resume_state.json")
+        )
+        _log_progress(f"Resolved output mode: {output_mode}")
+
+        resume_state = None
+        if not args.no_resume:
+            resume_state = _load_json(state_path)
+
+        existing_schema = None
+        existing_rows = 0
         resume_from_index = 0
-        existing_table = None
-        if not args.no_resume and os.path.exists(args.output_parquet):
-            resume_from_index = _get_parquet_row_count(args.output_parquet)
-            if resume_from_index > 0:
-                _log_progress(f"Found existing parquet with {resume_from_index} rows. Will resume...")
-                # Read existing data once to copy into new writer
-                try:
-                    existing_table = pq.read_table(args.output_parquet)
-                except Exception as exc:
-                    _log_progress(f"[warn] Failed to read existing parquet: {exc}. Starting fresh.")
-                    existing_table = None
-                    resume_from_index = 0
+        next_part = 0
 
-        total_yielded = resume_from_index
+        def _read_schema(path: str):
+            try:
+                return pq.read_schema(path)
+            except Exception as exc:
+                _log_progress(f"[warn] Failed to read parquet schema: {exc}")
+                return None
+
+        def _copy_existing_parquet(src_path: str, writer_obj) -> None:
+            parquet_file = pq.ParquetFile(src_path)
+            for i in range(parquet_file.num_row_groups):
+                writer_obj.write_table(parquet_file.read_row_group(i))
+
+        def _persist_state(next_index: int, rows_written: int, next_part_idx: int) -> None:
+            payload = {
+                "mode": output_mode,
+                "next_index": int(next_index),
+                "rows_written": int(rows_written),
+                "next_part": int(next_part_idx),
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            _ensure_dir(os.path.dirname(state_path) or ".")
+            _write_json_atomic(state_path, payload)
+
+        if output_mode == "dataset":
+            _ensure_dir(output_dir)
+            part_files, next_part_scan = _scan_parquet_dir(output_dir)
+            if args.no_resume and part_files:
+                _log_progress("[warn] --no_resume set: removing existing parquet shards in output directory.")
+                for path in part_files:
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+                part_files = tuple()
+                next_part_scan = 0
+
+            if part_files:
+                existing_rows = sum(_get_parquet_row_count(p) for p in part_files)
+                existing_schema = _read_schema(part_files[0])
+                next_part = next_part_scan
+                _log_progress(
+                    f"Found existing parquet dataset with {len(part_files)} files, {existing_rows} rows."
+                )
+
+            if resume_state and not args.no_resume and existing_rows > 0:
+                state_rows = int(resume_state.get("rows_written", existing_rows))
+                state_next = int(resume_state.get("next_index", existing_rows))
+                if state_rows != existing_rows:
+                    _log_progress(
+                        f"[warn] Resume state rows ({state_rows}) != existing rows ({existing_rows}); "
+                        "using filesystem rows."
+                    )
+                resume_from_index = max(state_next, existing_rows)
+            elif resume_state and not args.no_resume and existing_rows == 0:
+                _log_progress("[warn] Resume state found but no parquet files exist; ignoring state.")
+            else:
+                resume_from_index = existing_rows
+
+            total_yielded = existing_rows
+        else:
+            if args.no_resume:
+                if os.path.exists(output_path):
+                    _log_progress("[warn] --no_resume set: existing parquet will be overwritten.")
+                existing_rows = 0
+            else:
+                if os.path.exists(output_path):
+                    existing_rows = _get_parquet_row_count(output_path)
+                    existing_schema = _read_schema(output_path)
+                    if existing_rows > 0:
+                        _log_progress(f"Found existing parquet with {existing_rows} rows. Will resume...")
+
+            if resume_state and not args.no_resume and existing_rows > 0:
+                state_rows = int(resume_state.get("rows_written", existing_rows))
+                state_next = int(resume_state.get("next_index", existing_rows))
+                if state_rows != existing_rows:
+                    _log_progress(
+                        f"[warn] Resume state rows ({state_rows}) != file rows ({existing_rows}); "
+                        "ignoring state."
+                    )
+                    resume_from_index = existing_rows
+                else:
+                    resume_from_index = max(state_next, existing_rows)
+            else:
+                resume_from_index = existing_rows
+
+            if resume_from_index > 0:
+                _log_progress(
+                    "[warn] Single-file resume rewrites the parquet; use --output_mode dataset for true resume."
+                )
+
+            total_yielded = existing_rows
+
         batch_count = 0
         skipped_oom = 0
         skipped_for_resume = 0
+        pending_next_index = resume_from_index
+        last_seen_index = -1
 
+        completed_ok = False
         try:
             batch_items = []
             batch_paths = []
+            batch_indices = []
             temp_paths = []
 
             if resume_from_index > 0:
@@ -584,8 +797,93 @@ def main() -> None:
 
             _log_progress("Starting streaming parquet generation...")
 
+            def _build_table(rows):
+                nonlocal existing_schema
+                if existing_schema is not None:
+                    try:
+                        return pa.Table.from_pylist(rows, schema=existing_schema)
+                    except Exception as exc:
+                        raise SystemExit(
+                            f"Schema mismatch with existing parquet. "
+                            f"Use --no_resume or consistent settings. Details: {exc}"
+                        ) from exc
+                table = pa.Table.from_pylist(rows)
+                existing_schema = table.schema
+                return table
+
+            def _init_file_writer(table_schema):
+                nonlocal writer, tmp_output_path, existing_schema
+                if writer is not None:
+                    return
+                _ensure_dir(os.path.dirname(output_path) or ".")
+                fd, tmp_path = tempfile.mkstemp(suffix=".parquet", dir=os.path.dirname(output_path) or ".")
+                os.close(fd)
+                tmp_output_path = tmp_path
+                writer = pq.ParquetWriter(tmp_output_path, table_schema)
+                if existing_rows > 0 and os.path.exists(output_path):
+                    _copy_existing_parquet(output_path, writer)
+
+            def _flush_batch(is_final: bool = False):
+                nonlocal batch_count, skipped_oom, total_yielded, pending_next_index, next_part
+                if not batch_items:
+                    return
+                batch_count += 1
+                rows = []
+                if args.with_audio_codes:
+                    _log_progress(
+                        f"{'Processing final batch' if is_final else 'Encoding batch'} "
+                        f"{batch_count} ({len(batch_items)} samples)..."
+                    )
+                    encoded_pairs = _encode_batch_with_fallback(batch_items, batch_paths, batch_count)
+                    skipped_oom += len(batch_items) - len(encoded_pairs)
+                    for row, code in encoded_pairs:
+                        rows.append(_build_output_row(row, code, args.schema))
+                    del encoded_pairs
+                else:
+                    if is_final:
+                        _log_progress(f"Processing final batch {batch_count} ({len(batch_items)} samples)...")
+                    for row in batch_items:
+                        rows.append(_build_output_row(row, None, args.schema))
+
+                batch_last_index = batch_indices[-1] if batch_indices else None
+                batch_items.clear()
+                batch_paths.clear()
+                batch_indices.clear()
+
+                if rows:
+                    table = _build_table(rows)
+                    del rows
+                    if output_mode == "file":
+                        _init_file_writer(table.schema)
+                        writer.write_table(table)
+                    else:
+                        _ensure_dir(output_dir)
+                        part_path = os.path.join(output_dir, f"part-{next_part:05d}.parquet")
+                        pq.write_table(table, part_path)
+                        next_part += 1
+                    total_yielded += len(table)
+                    del table
+                else:
+                    del rows
+
+                if batch_last_index is not None:
+                    pending_next_index = max(pending_next_index, batch_last_index + 1)
+
+                _log_progress(f"Batch {batch_count} done. Total rows: {total_yielded}")
+
+                gc.collect()
+                for p in temp_paths:
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+                temp_paths.clear()
+
+                if output_mode == "dataset":
+                    _persist_state(pending_next_index, total_yielded, next_part)
+
             for global_index, item in item_iter_with_index():
-                # Skip items until we reach resume point
+                last_seen_index = global_index
                 if global_index < resume_from_index:
                     skipped_for_resume += 1
                     if skipped_for_resume % 1000 == 0:
@@ -613,109 +911,56 @@ def main() -> None:
                 item["audio"] = audio_value
                 batch_items.append(item)
                 batch_paths.append(encode_path)
+                batch_indices.append(global_index)
 
                 if len(batch_items) >= args.batch_size:
-                    batch_count += 1
-                    rows = []
-                    if args.with_audio_codes:
-                        _log_progress(f"Encoding batch {batch_count} ({len(batch_items)} samples)...")
-                        encoded_pairs = _encode_batch_with_fallback(batch_items, batch_paths, batch_count)
-                        skipped_oom += len(batch_items) - len(encoded_pairs)
-                        for row, code in encoded_pairs:
-                            rows.append(_build_output_row(row, code, args.schema))
-                        del encoded_pairs
-                    else:
-                        for row in batch_items:
-                            rows.append(_build_output_row(row, None, args.schema))
+                    _flush_batch()
 
-                    # Clear batch memory before table creation
-                    batch_items.clear()
-                    batch_paths.clear()
-
-                    # Write batch to parquet (append via writer)
-                    if rows:
-                        table = pa.Table.from_pylist(rows)
-                        del rows
-                        if writer is None:
-                            _ensure_dir(os.path.dirname(args.output_parquet) or ".")
-                            writer = pq.ParquetWriter(args.output_parquet, table.schema)
-                            # Write existing data first (one-time copy)
-                            if existing_table is not None:
-                                writer.write_table(existing_table)
-                                del existing_table
-                                existing_table = None
-                        writer.write_table(table)
-                        total_yielded += len(table)
-                        del table
-                    else:
-                        del rows
-
-                    _log_progress(f"Batch {batch_count} done. Total rows: {total_yielded}")
-
-                    # Clear memory
-                    gc.collect()
-                    for p in temp_paths:
-                        try:
-                            os.remove(p)
-                        except Exception:
-                            pass
-                    temp_paths.clear()
-
-            # Process remaining items
             if batch_items:
-                batch_count += 1
-                rows = []
-                _log_progress(f"Processing final batch {batch_count} ({len(batch_items)} samples)...")
-                if args.with_audio_codes:
-                    encoded_pairs = _encode_batch_with_fallback(batch_items, batch_paths, batch_count)
-                    skipped_oom += len(batch_items) - len(encoded_pairs)
-                    for row, code in encoded_pairs:
-                        rows.append(_build_output_row(row, code, args.schema))
-                    del encoded_pairs
-                else:
-                    for row in batch_items:
-                        rows.append(_build_output_row(row, None, args.schema))
+                _flush_batch(is_final=True)
 
-                batch_items.clear()
-                batch_paths.clear()
+            if last_seen_index >= 0:
+                pending_next_index = max(pending_next_index, last_seen_index + 1)
 
-                if rows:
-                    table = pa.Table.from_pylist(rows)
-                    del rows
-                    if writer is None:
-                        _ensure_dir(os.path.dirname(args.output_parquet) or ".")
-                        writer = pq.ParquetWriter(args.output_parquet, table.schema)
-                        # Write existing data first (one-time copy)
-                        if existing_table is not None:
-                            writer.write_table(existing_table)
-                            del existing_table
-                            existing_table = None
-                    writer.write_table(table)
-                    total_yielded += len(table)
-                    del table
-                else:
-                    del rows
-
-                gc.collect()
-
-                for p in temp_paths:
-                    try:
-                        os.remove(p)
-                    except Exception:
-                        pass
-
-            # If no new data was written but we have existing data, just keep the file
-            if writer is None and existing_table is not None:
-                _log_progress("No new data to add. Existing parquet unchanged.")
-                total_yielded = resume_from_index
+            if output_mode == "dataset":
+                if batch_count == 0 and total_yielded == existing_rows:
+                    _log_progress("No new data to add. Existing parquet unchanged.")
+            else:
+                if writer is None and existing_rows > 0:
+                    _log_progress("No new data to add. Existing parquet unchanged.")
 
             if skipped_oom:
                 _log_progress(f"[warn] Skipped {skipped_oom} samples due to CUDA OOM.")
             _log_progress(f"Parquet generation complete. Total batches: {batch_count}, Total rows: {total_yielded}")
+            completed_ok = True
         finally:
-            if writer is not None:
-                writer.close()
-            tmp_dir.cleanup()
+            try:
+                if writer is not None:
+                    writer.close()
+                    if tmp_output_path:
+                        if completed_ok:
+                            os.replace(tmp_output_path, output_path)
+                        else:
+                            try:
+                                os.remove(tmp_output_path)
+                            except Exception:
+                                pass
+            finally:
+                tmp_dir.cleanup()
+
+        if output_mode == "file" and completed_ok:
+            _persist_state(pending_next_index, total_yielded, 0)
+        elif output_mode == "dataset" and total_yielded == existing_rows and not batch_count:
+            _persist_state(pending_next_index, total_yielded, next_part)
+
+        if output_mode == "dataset" and completed_ok and merge_output_path:
+            part_files, _ = _scan_parquet_dir(output_dir)
+            if part_files:
+                _log_progress(f"Merging {len(part_files)} parquet shards into {merge_output_path}...")
+                merged_rows = _merge_parquet_shards(part_files, merge_output_path)
+                _log_progress(f"Merged parquet rows: {merged_rows}")
+            else:
+                _log_progress("[warn] No parquet shards found for merge; skipping merge.")
 
         return total_yielded
 

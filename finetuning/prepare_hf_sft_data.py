@@ -479,6 +479,7 @@ def main() -> None:
 
     def _encode_batch_with_fallback(batch_items, batch_paths, batch_idx):
         def _encode_chunk(chunk_items, chunk_paths, depth):
+            enc = None
             try:
                 with torch.no_grad():
                     enc = tokenizer.encode(chunk_paths)
@@ -489,24 +490,39 @@ def main() -> None:
                         codes.append(enc.audio_codes[i].contiguous().cpu().tolist())
                         enc.audio_codes[i] = None
                 del enc
+                enc = None
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                     torch.cuda.empty_cache()
                 return list(zip(chunk_items, codes))
             except Exception as exc:
+                # OOM 여부와 관계없이 enc가 있으면 정리
+                if enc is not None:
+                    try:
+                        for i in range(len(enc.audio_codes)):
+                            enc.audio_codes[i] = None
+                    except Exception:
+                        pass
+                    del enc
+                    enc = None
+                gc.collect()
+                _clear_cuda_cache()
+
                 if not _is_cuda_oom(exc):
                     raise
                 _log_progress(
                     f"[warn] CUDA OOM in batch {batch_idx} (size={len(chunk_items)}, depth={depth}). "
                     "Splitting batch to reduce max sequence length."
                 )
-                _clear_cuda_cache()
                 if len(chunk_items) == 1:
                     _log_progress(f"[warn] Skipping sample due to CUDA OOM: {chunk_paths[0]}")
                     return []
                 mid = len(chunk_items) // 2
                 left = _encode_chunk(chunk_items[:mid], chunk_paths[:mid], depth + 1)
+                # left 처리 후 right 처리 전에 GPU 플러시
+                gc.collect()
+                _clear_cuda_cache()
                 right = _encode_chunk(chunk_items[mid:], chunk_paths[mid:], depth + 1)
                 return left + right
 

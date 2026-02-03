@@ -1,4 +1,5 @@
 import argparse
+import gc
 import io
 import os
 import re
@@ -55,6 +56,55 @@ def _install_excepthook() -> None:
 TAG_RE = re.compile(r"<[^>]*>")
 BRACE_RE = re.compile(r"\{[^}]*\}")
 BATCH_INFER_NUM = 32
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    oom_type = getattr(torch.cuda, "OutOfMemoryError", RuntimeError)
+    if isinstance(exc, oom_type):
+        return True
+    msg = str(exc).lower()
+    return "cuda out of memory" in msg
+
+
+def _clear_cuda_cache() -> None:
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+    gc.collect()
+
+
+def _disable_model_cache(model) -> None:
+    def _disable(module) -> None:
+        cfg = getattr(module, "config", None)
+        if cfg is not None and hasattr(cfg, "use_cache"):
+            cfg.use_cache = False
+
+    _disable(model)
+    for submodule in model.modules():
+        _disable(submodule)
+
+
+def _get_audio_num_samples(path: str, target_sr: Optional[int]) -> Optional[int]:
+    if not path or target_sr is None:
+        return None
+    try:
+        import soundfile as sf
+    except Exception:
+        return None
+    try:
+        info = sf.info(path)
+    except Exception:
+        return None
+    if info.frames <= 0 or info.samplerate <= 0:
+        return None
+    return int(info.frames * (float(target_sr) / float(info.samplerate)))
 
 
 def _normalize_lang(value: Optional[str]) -> Optional[str]:
@@ -330,6 +380,18 @@ def main() -> None:
     parser.add_argument("--tokenizer_model_path", type=str, default="Qwen/Qwen3-TTS-Tokenizer-12Hz")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--batch_size", type=int, default=BATCH_INFER_NUM)
+    parser.add_argument(
+        "--max_audio_seconds",
+        type=float,
+        default=None,
+        help="Skip samples longer than this duration (seconds). Default: no limit.",
+    )
+    parser.add_argument(
+        "--max_length_ratio",
+        type=float,
+        default=4.0,
+        help="Flush current batch if next sample is this multiple longer than current max length.",
+    )
     parser.add_argument("--no_arknights_download", action="store_true")
     parser.add_argument("--genshin_split", type=str, default="train")
     parser.add_argument("--starrail_split", type=str, default="train")
@@ -347,6 +409,8 @@ def main() -> None:
     _log_progress(f"  Max per dataset: {args.max_per_dataset}")
     _log_progress(f"  With audio codes: {args.with_audio_codes}")
     _log_progress(f"  Batch size: {args.batch_size}")
+    _log_progress(f"  Max audio seconds: {args.max_audio_seconds}")
+    _log_progress(f"  Max length ratio: {args.max_length_ratio}")
     _log_progress("=" * 50)
 
     allowed_langs = {
@@ -400,7 +464,7 @@ def main() -> None:
         )
         # Disable KV caching in encoder transformer - not needed for encoding
         # and causes massive memory accumulation via DynamicCache
-        tokenizer.model.encoder.config.use_cache = False
+        _disable_model_cache(tokenizer.model)
         _log_progress("Tokenizer loaded successfully (encoder cache disabled).")
     else:
         _log_progress("Skipping tokenizer loading (--with_audio_codes not set)")
@@ -413,11 +477,47 @@ def main() -> None:
             "Missing dependency: pyarrow. Please install it first, `pip install pyarrow`."
         ) from exc
 
+    def _encode_batch_with_fallback(batch_items, batch_paths, batch_idx):
+        def _encode_chunk(chunk_items, chunk_paths, depth):
+            try:
+                with torch.no_grad():
+                    enc = tokenizer.encode(chunk_paths)
+                    codes = []
+                    # .contiguous()로 view→독립 텐서 변환 후 CPU로 복사
+                    # 원본 참조를 끊어 GPU 메모리 즉시 해제 가능하게 함
+                    for i in range(len(enc.audio_codes)):
+                        codes.append(enc.audio_codes[i].contiguous().cpu().tolist())
+                        enc.audio_codes[i] = None
+                del enc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                return list(zip(chunk_items, codes))
+            except Exception as exc:
+                if not _is_cuda_oom(exc):
+                    raise
+                _log_progress(
+                    f"[warn] CUDA OOM in batch {batch_idx} (size={len(chunk_items)}, depth={depth}). "
+                    "Splitting batch to reduce max sequence length."
+                )
+                _clear_cuda_cache()
+                if len(chunk_items) == 1:
+                    _log_progress(f"[warn] Skipping sample due to CUDA OOM: {chunk_paths[0]}")
+                    return []
+                mid = len(chunk_items) // 2
+                left = _encode_chunk(chunk_items[:mid], chunk_paths[:mid], depth + 1)
+                right = _encode_chunk(chunk_items[mid:], chunk_paths[mid:], depth + 1)
+                return left + right
+
+        return _encode_chunk(batch_items, batch_paths, 0)
+
     def _process_and_write_streaming():
         tmp_dir = tempfile.TemporaryDirectory()
         writer = None
         total_yielded = 0
         batch_count = 0
+        skipped_oom = 0
 
         try:
             batch_items = []
@@ -450,34 +550,32 @@ def main() -> None:
                     rows = []
                     if args.with_audio_codes:
                         _log_progress(f"Encoding batch {batch_count} ({len(batch_items)} samples)...")
-                        with torch.no_grad():
-                            enc = tokenizer.encode(batch_paths)
-                            codes_list = []
-                            for code in enc.audio_codes:
-                                codes_list.append(code.cpu().tolist())
-                            del enc.audio_codes
-                        del enc
-                        torch.cuda.synchronize()
-                        torch.cuda.empty_cache()
-                        for code, row in zip(codes_list, batch_items):
+                        encoded_pairs = _encode_batch_with_fallback(batch_items, batch_paths, batch_count)
+                        skipped_oom += len(batch_items) - len(encoded_pairs)
+                        for row, code in encoded_pairs:
                             rows.append(_build_output_row(row, code, args.schema))
+                        del encoded_pairs
                     else:
                         for row in batch_items:
                             rows.append(_build_output_row(row, None, args.schema))
 
+                    # Clear batch memory before table creation to avoid peak
+                    batch_items.clear()
+                    batch_paths.clear()
+
                     # Write batch to parquet
                     table = pa.Table.from_pylist(rows)
+                    del rows
                     if writer is None:
                         _ensure_dir(os.path.dirname(args.output_parquet) or ".")
                         writer = pq.ParquetWriter(args.output_parquet, table.schema)
                     writer.write_table(table)
-                    total_yielded += len(rows)
+                    total_yielded += len(table)
                     _log_progress(f"Batch {batch_count} done. Total rows written: {total_yielded}")
 
                     # Clear memory
-                    del rows, table
-                    batch_items.clear()
-                    batch_paths.clear()
+                    del table
+                    gc.collect()
                     for p in temp_paths:
                         try:
                             os.remove(p)
@@ -491,22 +589,28 @@ def main() -> None:
                 rows = []
                 _log_progress(f"Processing final batch {batch_count} ({len(batch_items)} samples)...")
                 if args.with_audio_codes:
-                    enc = tokenizer.encode(batch_paths)
-                    codes_list = [code.cpu().tolist() for code in enc.audio_codes]
-                    del enc
-                    torch.cuda.empty_cache()
-                    for code, row in zip(codes_list, batch_items):
+                    encoded_pairs = _encode_batch_with_fallback(batch_items, batch_paths, batch_count)
+                    skipped_oom += len(batch_items) - len(encoded_pairs)
+                    for row, code in encoded_pairs:
                         rows.append(_build_output_row(row, code, args.schema))
+                    del encoded_pairs
                 else:
                     for row in batch_items:
                         rows.append(_build_output_row(row, None, args.schema))
 
+                # Clear batch memory before table creation
+                batch_items.clear()
+                batch_paths.clear()
+
                 table = pa.Table.from_pylist(rows)
+                del rows
                 if writer is None:
                     _ensure_dir(os.path.dirname(args.output_parquet) or ".")
                     writer = pq.ParquetWriter(args.output_parquet, table.schema)
                 writer.write_table(table)
-                total_yielded += len(rows)
+                total_yielded += len(table)
+                del table
+                gc.collect()
 
                 for p in temp_paths:
                     try:
@@ -514,6 +618,8 @@ def main() -> None:
                     except Exception:
                         pass
 
+            if skipped_oom:
+                _log_progress(f"[warn] Skipped {skipped_oom} samples due to CUDA OOM.")
             _log_progress(f"Parquet generation complete. Total batches: {batch_count}, Total rows: {total_yielded}")
         finally:
             if writer is not None:

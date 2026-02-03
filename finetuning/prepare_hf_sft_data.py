@@ -107,6 +107,19 @@ def _get_audio_num_samples(path: str, target_sr: Optional[int]) -> Optional[int]
     return int(info.frames * (float(target_sr) / float(info.samplerate)))
 
 
+def _get_parquet_row_count(path: str) -> int:
+    """Get number of rows in existing parquet file, or 0 if not exists."""
+    if not path or not os.path.exists(path):
+        return 0
+    try:
+        import pyarrow.parquet as pq
+        metadata = pq.read_metadata(path)
+        return metadata.num_rows
+    except Exception as exc:
+        _log_progress(f"[warn] Failed to read parquet metadata: {exc}")
+        return 0
+
+
 def _normalize_lang(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
@@ -397,6 +410,11 @@ def main() -> None:
     parser.add_argument("--starrail_split", type=str, default="train")
     parser.add_argument("--arknights_split", type=str, default="train")
     parser.add_argument("--log_file", type=str, default=None, help="Path to log file (appends)")
+    parser.add_argument(
+        "--no_resume",
+        action="store_true",
+        help="Ignore existing parquet file and start fresh.",
+    )
     args = parser.parse_args()
 
     if args.log_file:
@@ -423,7 +441,9 @@ def main() -> None:
         ("simon3000/starrail-voice", args.starrail_split),
     ]
 
-    def item_iter():
+    def item_iter_with_index():
+        """Yields (global_index, item) tuples."""
+        global_index = 0
         _log_progress(f"Processing {len(datasets)} simon datasets + arknights")
         for name, split in datasets:
             _log_progress(f"--- Starting dataset: {name} ---")
@@ -434,7 +454,8 @@ def main() -> None:
                 args.cache_dir,
                 args.max_per_dataset,
             ):
-                yield item
+                yield global_index, item
+                global_index += 1
             _log_progress(f"--- Completed dataset: {name} ---")
 
         _log_progress("--- Starting dataset: arknights ---")
@@ -446,7 +467,8 @@ def main() -> None:
             not args.no_arknights_download,
             args.max_per_dataset,
         ):
-            yield item
+            yield global_index, item
+            global_index += 1
         _log_progress("--- Completed dataset: arknights ---")
 
     tokenizer = None
@@ -531,17 +553,48 @@ def main() -> None:
     def _process_and_write_streaming():
         tmp_dir = tempfile.TemporaryDirectory()
         writer = None
-        total_yielded = 0
+
+        # Resume from existing parquet file row count (read metadata only, not full file)
+        resume_from_index = 0
+        existing_table = None
+        if not args.no_resume and os.path.exists(args.output_parquet):
+            resume_from_index = _get_parquet_row_count(args.output_parquet)
+            if resume_from_index > 0:
+                _log_progress(f"Found existing parquet with {resume_from_index} rows. Will resume...")
+                # Read existing data once to copy into new writer
+                try:
+                    existing_table = pq.read_table(args.output_parquet)
+                except Exception as exc:
+                    _log_progress(f"[warn] Failed to read existing parquet: {exc}. Starting fresh.")
+                    existing_table = None
+                    resume_from_index = 0
+
+        total_yielded = resume_from_index
         batch_count = 0
         skipped_oom = 0
+        skipped_for_resume = 0
 
         try:
             batch_items = []
             batch_paths = []
             temp_paths = []
+
+            if resume_from_index > 0:
+                _log_progress(f"Skipping first {resume_from_index} items...")
+
             _log_progress("Starting streaming parquet generation...")
 
-            for item in item_iter():
+            for global_index, item in item_iter_with_index():
+                # Skip items until we reach resume point
+                if global_index < resume_from_index:
+                    skipped_for_resume += 1
+                    if skipped_for_resume % 1000 == 0:
+                        _log_progress(f"  Skipped {skipped_for_resume} items...")
+                    continue
+
+                if skipped_for_resume > 0 and global_index == resume_from_index:
+                    _log_progress(f"Resuming from index {global_index} (skipped {skipped_for_resume} items)")
+
                 audio_value = item.get("audio")
                 if not isinstance(audio_value, dict):
                     continue
@@ -575,22 +628,31 @@ def main() -> None:
                         for row in batch_items:
                             rows.append(_build_output_row(row, None, args.schema))
 
-                    # Clear batch memory before table creation to avoid peak
+                    # Clear batch memory before table creation
                     batch_items.clear()
                     batch_paths.clear()
 
-                    # Write batch to parquet
-                    table = pa.Table.from_pylist(rows)
-                    del rows
-                    if writer is None:
-                        _ensure_dir(os.path.dirname(args.output_parquet) or ".")
-                        writer = pq.ParquetWriter(args.output_parquet, table.schema)
-                    writer.write_table(table)
-                    total_yielded += len(table)
-                    _log_progress(f"Batch {batch_count} done. Total rows written: {total_yielded}")
+                    # Write batch to parquet (append via writer)
+                    if rows:
+                        table = pa.Table.from_pylist(rows)
+                        del rows
+                        if writer is None:
+                            _ensure_dir(os.path.dirname(args.output_parquet) or ".")
+                            writer = pq.ParquetWriter(args.output_parquet, table.schema)
+                            # Write existing data first (one-time copy)
+                            if existing_table is not None:
+                                writer.write_table(existing_table)
+                                del existing_table
+                                existing_table = None
+                        writer.write_table(table)
+                        total_yielded += len(table)
+                        del table
+                    else:
+                        del rows
+
+                    _log_progress(f"Batch {batch_count} done. Total rows: {total_yielded}")
 
                     # Clear memory
-                    del table
                     gc.collect()
                     for p in temp_paths:
                         try:
@@ -614,18 +676,26 @@ def main() -> None:
                     for row in batch_items:
                         rows.append(_build_output_row(row, None, args.schema))
 
-                # Clear batch memory before table creation
                 batch_items.clear()
                 batch_paths.clear()
 
-                table = pa.Table.from_pylist(rows)
-                del rows
-                if writer is None:
-                    _ensure_dir(os.path.dirname(args.output_parquet) or ".")
-                    writer = pq.ParquetWriter(args.output_parquet, table.schema)
-                writer.write_table(table)
-                total_yielded += len(table)
-                del table
+                if rows:
+                    table = pa.Table.from_pylist(rows)
+                    del rows
+                    if writer is None:
+                        _ensure_dir(os.path.dirname(args.output_parquet) or ".")
+                        writer = pq.ParquetWriter(args.output_parquet, table.schema)
+                        # Write existing data first (one-time copy)
+                        if existing_table is not None:
+                            writer.write_table(existing_table)
+                            del existing_table
+                            existing_table = None
+                    writer.write_table(table)
+                    total_yielded += len(table)
+                    del table
+                else:
+                    del rows
+
                 gc.collect()
 
                 for p in temp_paths:
@@ -633,6 +703,11 @@ def main() -> None:
                         os.remove(p)
                     except Exception:
                         pass
+
+            # If no new data was written but we have existing data, just keep the file
+            if writer is None and existing_table is not None:
+                _log_progress("No new data to add. Existing parquet unchanged.")
+                total_yielded = resume_from_index
 
             if skipped_oom:
                 _log_progress(f"[warn] Skipped {skipped_oom} samples due to CUDA OOM.")

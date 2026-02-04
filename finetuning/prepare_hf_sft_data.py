@@ -289,6 +289,186 @@ def _audio_obj_to_bytes_and_path(
         return None, None
 
 
+def _make_match_key(text: Optional[str], speaker: Optional[str], language: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    t = _clean_dialog_text(text)
+    if not t:
+        return None
+    s = str(speaker).strip() if speaker is not None else ""
+    l = _normalize_lang(language) or ""
+    return f"{t}||{s}||{l}"
+
+
+def _read_parquet_tail_rows(
+    parquet_paths: Tuple[str, ...], num_rows: int, columns: Tuple[str, ...]
+) -> Tuple[Dict, ...]:
+    if not parquet_paths or num_rows <= 0:
+        return tuple()
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except Exception as exc:
+        raise SystemExit(
+            "Missing dependency: pyarrow. Please install it first, `pip install pyarrow`."
+        ) from exc
+
+    try:
+        schema = pq.ParquetFile(parquet_paths[0]).schema
+        available = set(schema.names)
+        columns = tuple([c for c in columns if c in available])
+    except Exception:
+        columns = tuple(columns)
+    if not columns:
+        return tuple()
+
+    remaining = num_rows
+    collected = []
+    for path in reversed(parquet_paths):
+        if remaining <= 0:
+            break
+        try:
+            parquet_file = pq.ParquetFile(path)
+        except Exception:
+            continue
+        for row_group in reversed(range(parquet_file.num_row_groups)):
+            table = parquet_file.read_row_group(row_group, columns=list(columns))
+            if table.num_rows >= remaining:
+                table = table.slice(table.num_rows - remaining, remaining)
+                collected.append(table)
+                remaining = 0
+                break
+            collected.append(table)
+            remaining -= table.num_rows
+        if remaining <= 0:
+            break
+
+    if not collected:
+        return tuple()
+    tail_table = pa.concat_tables(list(reversed(collected)))
+    return tuple(tail_table.to_pylist())
+
+
+def _infer_resume_cursor_from_tail(
+    output_mode: str,
+    output_path: str,
+    output_dir: str,
+    tail_rows: int,
+    sequence_len: int,
+    datasets: Tuple[Tuple[str, str], ...],
+    arknights_name: str,
+    arknights_split: str,
+    cache_dir: Optional[str],
+    allowed_langs: Set[str],
+    log_fn,
+) -> Optional[Dict[str, object]]:
+    if tail_rows <= 0:
+        return None
+    if output_mode == "file":
+        parquet_paths = (output_path,)
+    else:
+        parquet_paths, _ = _scan_parquet_dir(output_dir)
+    if not parquet_paths:
+        return None
+
+    columns = ("source", "text", "transcript", "speaker", "language")
+    rows = _read_parquet_tail_rows(parquet_paths, tail_rows, columns)
+    if not rows:
+        return None
+
+    last_source = None
+    for row in reversed(rows):
+        source = row.get("source")
+        text_val = row.get("text") or row.get("transcript")
+        if source and text_val:
+            last_source = source
+            break
+    if not last_source:
+        log_fn("[warn] Unable to infer resume dataset: missing source/text in parquet tail.")
+        return None
+
+    anchor_keys = []
+    for row in rows:
+        if row.get("source") != last_source:
+            continue
+        text_val = row.get("text") or row.get("transcript")
+        key = _make_match_key(text_val, row.get("speaker"), row.get("language"))
+        if key:
+            anchor_keys.append(key)
+    if not anchor_keys:
+        log_fn("[warn] No valid anchor keys found in parquet tail.")
+        return None
+
+    sequence_len = max(1, min(sequence_len, len(anchor_keys)))
+    anchor_seq = anchor_keys[-sequence_len:]
+
+    split = None
+    dataset_kind = None
+    for name, ds_split in datasets:
+        if name == last_source:
+            split = ds_split
+            dataset_kind = "simon"
+            break
+    if last_source == arknights_name:
+        split = arknights_split
+        dataset_kind = "arknights"
+
+    if split is None:
+        log_fn(f"[warn] Resume dataset not in configured list: {last_source}")
+        return None
+
+    log_fn(
+        f"Searching dataset for resume anchors: {last_source} split={split} "
+        f"(tail_rows={tail_rows}, sequence_len={sequence_len})"
+    )
+
+    ds = load_dataset(last_source, split=split, streaming=False, cache_dir=cache_dir)
+    if "audio" in ds.features:
+        try:
+            ds = ds.cast_column("audio", Audio(decode=False))
+        except Exception:
+            pass
+
+    def _make_key_from_row(row: Dict) -> Optional[str]:
+        if dataset_kind == "arknights":
+            text_val = row.get("voice_text")
+            if not text_val:
+                return None
+            text_val = " ".join(str(text_val).split()).strip()
+            if not text_val:
+                return None
+            return _make_match_key(text_val, row.get("char_id"), "korean")
+
+        text_val = row.get("transcription")
+        if not text_val or not str(text_val).strip():
+            return None
+        lang = _extract_lang(row)
+        if allowed_langs and (lang is None or lang not in allowed_langs):
+            return None
+        return _make_match_key(text_val, row.get("speaker"), lang)
+
+    match_end_index = None
+    seq_pos = 0
+    first_anchor = anchor_seq[0]
+    for idx, row in enumerate(ds):
+        key = _make_key_from_row(row)
+        if key is None:
+            continue
+        if key == anchor_seq[seq_pos]:
+            seq_pos += 1
+            if seq_pos == len(anchor_seq):
+                match_end_index = idx
+                seq_pos = 0
+        else:
+            seq_pos = 1 if key == first_anchor else 0
+
+    if match_end_index is None:
+        log_fn("[warn] Failed to locate resume anchors in dataset.")
+        return None
+
+    return {"name": last_source, "split": split, "raw_index": int(match_end_index + 1)}
+
+
 def _merge_parquet_shards(part_files: Tuple[str, ...], output_path: str) -> int:
     if not part_files:
         _log_progress("[warn] No parquet shards found to merge.")
@@ -373,36 +553,75 @@ def _iter_simon_dataset(
     allowed_langs: Set[str],
     cache_dir: Optional[str],
     max_rows: Optional[int],
-) -> Iterable[Dict]:
-    _log_progress(f"Loading dataset: {dataset_name} (split={split}, streaming=True)")
-    ds = load_dataset(dataset_name, split=split, streaming=True, cache_dir=cache_dir)
+    start_index: int = 0,
+    streaming: bool = True,
+) -> Iterable[Tuple[int, Dict]]:
+    _log_progress(
+        f"Loading dataset: {dataset_name} (split={split}, streaming={streaming}, start_index={start_index})"
+    )
+    ds = None
+    base_index = 0
+    manual_skip = False
+
+    if streaming:
+        ds = load_dataset(dataset_name, split=split, streaming=True, cache_dir=cache_dir)
+        if start_index > 0:
+            try:
+                ds = ds.skip(start_index)
+                base_index = start_index
+            except Exception:
+                manual_skip = True
+    else:
+        if start_index > 0:
+            try:
+                ds = load_dataset(
+                    dataset_name,
+                    split=f"{split}[{start_index}:]",
+                    streaming=False,
+                    cache_dir=cache_dir,
+                )
+                base_index = start_index
+            except Exception:
+                ds = load_dataset(dataset_name, split=split, streaming=False, cache_dir=cache_dir)
+                try:
+                    ds = ds.select(range(start_index, len(ds)))
+                    base_index = start_index
+                except Exception:
+                    manual_skip = True
+        else:
+            ds = load_dataset(dataset_name, split=split, streaming=False, cache_dir=cache_dir)
+
     if "audio" in ds.features:
         try:
             ds = ds.cast_column("audio", Audio(decode=False))
         except Exception:
             pass
 
-    def _row_filter(row: Dict) -> bool:
-        text = row.get("transcription")
-        if not text or not str(text).strip():
-            return False
-        if not allowed_langs:
-            return True
-        lang = _extract_lang(row)
-        return lang is not None and lang in allowed_langs
-
-    ds = ds.filter(_row_filter)
     dataset_short = dataset_name.split("/")[-1]
     _log_progress(f"Starting iteration over {dataset_short}...")
     yielded = 0
-    for idx, row in enumerate(ds):
-        if max_rows is not None and idx >= max_rows:
+
+    if manual_skip:
+        _log_progress(f"[{dataset_short}] Falling back to manual skip for start_index={start_index}")
+
+    enum_start = base_index if base_index > 0 and not manual_skip else 0
+    for idx, row in enumerate(ds, start=enum_start):
+        if manual_skip and idx < start_index:
+            continue
+        if max_rows is not None and yielded >= max_rows:
             _log_progress(f"[{dataset_short}] Reached max_rows limit ({max_rows})")
             break
-        text = _clean_dialog_text(row.get("transcription"))
-        if not text:
+
+        text = row.get("transcription")
+        if not text or not str(text).strip():
             continue
         lang = _extract_lang(row)
+        if allowed_langs and (lang is None or lang not in allowed_langs):
+            continue
+        text = _clean_dialog_text(text)
+        if not text:
+            continue
+
         audio_bytes, audio_path = _audio_obj_to_bytes_and_path(row.get("audio"), dataset_short, idx)
         if audio_bytes is None and (audio_path is None or not os.path.isfile(audio_path)):
             continue
@@ -421,7 +640,7 @@ def _iter_simon_dataset(
         yielded += 1
         if yielded % 500 == 0:
             _log_progress(f"[{dataset_short}] Yielded {yielded} samples (iter idx={idx})")
-        yield item
+        yield idx, item
     _log_progress(f"[{dataset_short}] Finished. Total yielded: {yielded}")
 
 
@@ -432,15 +651,39 @@ def _iter_arknights_dataset(
     audio_dir: Optional[str],
     download_audio: bool,
     max_rows: Optional[int],
-) -> Iterable[Dict]:
-    _log_progress(f"Loading dataset: {dataset_name} (split={split})")
-    ds = load_dataset(dataset_name, split=split, cache_dir=cache_dir)
+    start_index: int = 0,
+) -> Iterable[Tuple[int, Dict]]:
+    _log_progress(f"Loading dataset: {dataset_name} (split={split}, start_index={start_index})")
+    base_index = 0
+    manual_skip = False
+    ds = None
+    if start_index > 0:
+        try:
+            ds = load_dataset(
+                dataset_name, split=f"{split}[{start_index}:]", cache_dir=cache_dir
+            )
+            base_index = start_index
+        except Exception:
+            ds = load_dataset(dataset_name, split=split, cache_dir=cache_dir)
+            try:
+                ds = ds.select(range(start_index, len(ds)))
+                base_index = start_index
+            except Exception:
+                manual_skip = True
+    else:
+        ds = load_dataset(dataset_name, split=split, cache_dir=cache_dir)
+
     total_rows = len(ds)
     _log_progress(f"[arknights] Total rows in dataset: {total_rows}")
     yielded = 0
     skipped = 0
-    for idx, row in enumerate(ds):
-        if max_rows is not None and idx >= max_rows:
+    if manual_skip:
+        _log_progress(f"[arknights] Falling back to manual skip for start_index={start_index}")
+    enum_start = base_index if base_index > 0 and not manual_skip else 0
+    for idx, row in enumerate(ds, start=enum_start):
+        if manual_skip and idx < start_index:
+            continue
+        if max_rows is not None and yielded >= max_rows:
             _log_progress(f"[arknights] Reached max_rows limit ({max_rows})")
             break
         text = row.get("voice_text")
@@ -483,7 +726,7 @@ def _iter_arknights_dataset(
         yielded += 1
         if yielded % 500 == 0:
             _log_progress(f"[arknights] Yielded {yielded} / processed {idx+1}/{total_rows} (skipped {skipped})")
-        yield item
+        yield idx, item
     _log_progress(f"[arknights] Finished. Total yielded: {yielded}, skipped: {skipped}")
 
 
@@ -515,6 +758,11 @@ def main() -> None:
     parser.add_argument("--cache_dir", type=str, default=None)
     parser.add_argument("--audio_dir", type=str, default="data/hf_audio")
     parser.add_argument("--max_per_dataset", type=int, default=None)
+    parser.add_argument(
+        "--no_streaming",
+        action="store_true",
+        help="Disable streaming for simon datasets (genshin/starrail) to enable fast indexed resume.",
+    )
     parser.add_argument("--with_audio_codes", action="store_true")
     parser.add_argument("--tokenizer_model_path", type=str, default="Qwen/Qwen3-TTS-Tokenizer-12Hz")
     parser.add_argument("--device", type=str, default="cuda")
@@ -535,6 +783,18 @@ def main() -> None:
     parser.add_argument("--genshin_split", type=str, default="train")
     parser.add_argument("--starrail_split", type=str, default="train")
     parser.add_argument("--arknights_split", type=str, default="train")
+    parser.add_argument(
+        "--resume_search_tail_rows",
+        type=int,
+        default=200,
+        help="If resume cursor is missing, scan this many tail rows from existing parquet to infer resume point.",
+    )
+    parser.add_argument(
+        "--resume_search_sequence",
+        type=int,
+        default=5,
+        help="Number of tail rows (same dataset) to use as an ordered sequence when searching resume point.",
+    )
     parser.add_argument("--log_file", type=str, default=None, help="Path to log file (appends)")
     parser.add_argument(
         "--no_resume",
@@ -556,8 +816,11 @@ def main() -> None:
     _log_progress(f"  Max per dataset: {args.max_per_dataset}")
     _log_progress(f"  With audio codes: {args.with_audio_codes}")
     _log_progress(f"  Batch size: {args.batch_size}")
+    _log_progress(f"  Simon streaming: {not args.no_streaming}")
     _log_progress(f"  Max audio seconds: {args.max_audio_seconds}")
     _log_progress(f"  Max length ratio: {args.max_length_ratio}")
+    _log_progress(f"  Resume search tail rows: {args.resume_search_tail_rows}")
+    _log_progress(f"  Resume search sequence: {args.resume_search_sequence}")
     _log_progress("=" * 50)
 
     allowed_langs = {
@@ -569,34 +832,88 @@ def main() -> None:
         ("simon3000/genshin-voice", args.genshin_split),
         ("simon3000/starrail-voice", args.starrail_split),
     ]
+    datasets_tuple = tuple(datasets)
 
-    def item_iter_with_index():
-        """Yields (global_index, item) tuples."""
-        global_index = 0
+    def item_iter_with_index(resume_cursor=None, resume_from_index=0, use_streaming: bool = True):
+        """Yields (global_index, dataset_name, dataset_split, raw_index, item)."""
+        global_index = resume_from_index
         _log_progress(f"Processing {len(datasets)} simon datasets + arknights")
+
+        cursor_key = None
+        cursor_raw_index = 0
+        cursor_reached = True
+        if resume_cursor:
+            cursor_key = (resume_cursor.get("name"), resume_cursor.get("split"))
+            cursor_raw_index = max(0, int(resume_cursor.get("raw_index", 0)))
+            cursor_reached = False
+            _log_progress(
+                f"Resume cursor: dataset={cursor_key[0]} split={cursor_key[1]} raw_index={cursor_raw_index}"
+            )
+
+        valid_keys = [(name, split) for name, split in datasets] + [
+            ("deepghs/arknights_voices_kr", args.arknights_split)
+        ]
+        if cursor_key and cursor_key not in valid_keys:
+            _log_progress(f"[warn] Resume cursor dataset not found: {cursor_key}. Ignoring cursor.")
+            cursor_key = None
+            cursor_reached = True
+
         for name, split in datasets:
-            _log_progress(f"--- Starting dataset: {name} ---")
-            for item in _iter_simon_dataset(
+            dataset_key = (name, split)
+            start_index = 0
+            if cursor_key and not cursor_reached:
+                if dataset_key == cursor_key:
+                    start_index = cursor_raw_index
+                    cursor_reached = True
+                    _log_progress(
+                        f"--- Resuming dataset: {name} (split={split}) from raw index {start_index} ---"
+                    )
+                else:
+                    _log_progress(f"--- Skipping dataset: {name} (resume cursor ahead) ---")
+                    continue
+
+            if cursor_key is None or cursor_reached:
+                _log_progress(f"--- Starting dataset: {name} ---")
+            for raw_index, item in _iter_simon_dataset(
                 name,
                 split,
                 allowed_langs,
                 args.cache_dir,
                 args.max_per_dataset,
+                start_index=start_index,
+                streaming=use_streaming,
             ):
-                yield global_index, item
+                yield global_index, name, split, raw_index, item
                 global_index += 1
             _log_progress(f"--- Completed dataset: {name} ---")
 
+        arknights_name = "deepghs/arknights_voices_kr"
+        arknights_split = args.arknights_split
+        dataset_key = (arknights_name, arknights_split)
+        start_index = 0
+        if cursor_key and not cursor_reached:
+            if dataset_key == cursor_key:
+                start_index = cursor_raw_index
+                cursor_reached = True
+                _log_progress(
+                    f"--- Resuming dataset: {arknights_name} (split={arknights_split}) "
+                    f"from raw index {start_index} ---"
+                )
+            else:
+                _log_progress(f"--- Skipping dataset: {arknights_name} (resume cursor ahead) ---")
+                return
+
         _log_progress("--- Starting dataset: arknights ---")
-        for item in _iter_arknights_dataset(
-            "deepghs/arknights_voices_kr",
-            args.arknights_split,
+        for raw_index, item in _iter_arknights_dataset(
+            arknights_name,
+            arknights_split,
             args.cache_dir,
             args.audio_dir,
             not args.no_arknights_download,
             args.max_per_dataset,
+            start_index=start_index,
         ):
-            yield global_index, item
+            yield global_index, arknights_name, arknights_split, raw_index, item
             global_index += 1
         _log_progress("--- Completed dataset: arknights ---")
 
@@ -707,6 +1024,17 @@ def main() -> None:
         if not args.no_resume:
             resume_state = _load_json(state_path)
 
+        resume_cursor = None
+        if resume_state:
+            cursor_state = resume_state.get("cursor") or resume_state.get("dataset_cursor")
+            if isinstance(cursor_state, dict):
+                if cursor_state.get("name") and cursor_state.get("split") is not None:
+                    resume_cursor = {
+                        "name": cursor_state.get("name"),
+                        "split": cursor_state.get("split"),
+                        "raw_index": int(cursor_state.get("raw_index", 0)),
+                    }
+
         existing_schema = None
         existing_rows = 0
         resume_from_index = 0
@@ -724,7 +1052,12 @@ def main() -> None:
             for i in range(parquet_file.num_row_groups):
                 writer_obj.write_table(parquet_file.read_row_group(i))
 
-        def _persist_state(next_index: int, rows_written: int, next_part_idx: int) -> None:
+        def _persist_state(
+            next_index: int,
+            rows_written: int,
+            next_part_idx: int,
+            cursor: Optional[Dict[str, object]] = None,
+        ) -> None:
             payload = {
                 "mode": output_mode,
                 "next_index": int(next_index),
@@ -732,8 +1065,14 @@ def main() -> None:
                 "next_part": int(next_part_idx),
                 "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
+            if cursor:
+                payload["cursor"] = cursor
             _ensure_dir(os.path.dirname(state_path) or ".")
             _write_json_atomic(state_path, payload)
+
+        if args.no_resume:
+            resume_state = None
+            resume_cursor = None
 
         if output_mode == "dataset":
             _ensure_dir(output_dir)
@@ -756,7 +1095,7 @@ def main() -> None:
                     f"Found existing parquet dataset with {len(part_files)} files, {existing_rows} rows."
                 )
 
-            if resume_state and not args.no_resume and existing_rows > 0:
+            if resume_state and existing_rows > 0:
                 state_rows = int(resume_state.get("rows_written", existing_rows))
                 state_next = int(resume_state.get("next_index", existing_rows))
                 if state_rows != existing_rows:
@@ -764,9 +1103,17 @@ def main() -> None:
                         f"[warn] Resume state rows ({state_rows}) != existing rows ({existing_rows}); "
                         "using filesystem rows."
                     )
+                    resume_cursor = None
                 resume_from_index = max(state_next, existing_rows)
-            elif resume_state and not args.no_resume and existing_rows == 0:
+                if resume_cursor:
+                    _log_progress(
+                        f"Using resume cursor for fast pickup: {resume_cursor.get('name')} "
+                        f"(split={resume_cursor.get('split')}) raw_index={resume_cursor.get('raw_index')}"
+                    )
+            elif resume_state and existing_rows == 0:
                 _log_progress("[warn] Resume state found but no parquet files exist; ignoring state.")
+                resume_cursor = None
+                resume_from_index = existing_rows
             else:
                 resume_from_index = existing_rows
 
@@ -783,7 +1130,7 @@ def main() -> None:
                     if existing_rows > 0:
                         _log_progress(f"Found existing parquet with {existing_rows} rows. Will resume...")
 
-            if resume_state and not args.no_resume and existing_rows > 0:
+            if resume_state and existing_rows > 0:
                 state_rows = int(resume_state.get("rows_written", existing_rows))
                 state_next = int(resume_state.get("next_index", existing_rows))
                 if state_rows != existing_rows:
@@ -791,9 +1138,15 @@ def main() -> None:
                         f"[warn] Resume state rows ({state_rows}) != file rows ({existing_rows}); "
                         "ignoring state."
                     )
+                    resume_cursor = None
                     resume_from_index = existing_rows
                 else:
                     resume_from_index = max(state_next, existing_rows)
+                if resume_cursor:
+                    _log_progress(
+                        f"Using resume cursor for fast pickup: {resume_cursor.get('name')} "
+                        f"(split={resume_cursor.get('split')}) raw_index={resume_cursor.get('raw_index')}"
+                    )
             else:
                 resume_from_index = existing_rows
 
@@ -804,20 +1157,62 @@ def main() -> None:
 
             total_yielded = existing_rows
 
+        force_non_streaming = False
+        if resume_cursor is None and resume_from_index > 0 and args.resume_search_tail_rows > 0:
+            inferred_cursor = _infer_resume_cursor_from_tail(
+                output_mode=output_mode,
+                output_path=output_path,
+                output_dir=output_dir,
+                tail_rows=args.resume_search_tail_rows,
+                sequence_len=args.resume_search_sequence,
+                datasets=datasets_tuple,
+                arknights_name="deepghs/arknights_voices_kr",
+                arknights_split=args.arknights_split,
+                cache_dir=args.cache_dir,
+                allowed_langs=allowed_langs,
+                log_fn=_log_progress,
+            )
+            if inferred_cursor:
+                resume_cursor = inferred_cursor
+                force_non_streaming = True
+                _log_progress(
+                    f"Inferred resume cursor: {resume_cursor.get('name')} "
+                    f"(split={resume_cursor.get('split')}) raw_index={resume_cursor.get('raw_index')}"
+                )
+                _log_progress("Fast resume enabled: forcing non-streaming dataset load.")
+            else:
+                _log_progress("[warn] Resume cursor inference failed; falling back to slow resume.")
+
+        use_streaming = not args.no_streaming and not force_non_streaming
+
+        valid_cursor_keys = set(datasets_tuple)
+        valid_cursor_keys.add(("deepghs/arknights_voices_kr", args.arknights_split))
+        if resume_cursor:
+            key = (resume_cursor.get("name"), resume_cursor.get("split"))
+            if key not in valid_cursor_keys:
+                _log_progress(f"[warn] Resume cursor dataset not found: {key}. Ignoring cursor.")
+                resume_cursor = None
+
         batch_count = 0
         skipped_oom = 0
         skipped_for_resume = 0
         pending_next_index = resume_from_index
+        pending_cursor = resume_cursor.copy() if resume_cursor else None
         last_seen_index = -1
+        last_seen_dataset_key = None
+        last_seen_raw_index = None
+        use_cursor_resume = resume_cursor is not None
 
         completed_ok = False
         try:
             batch_items = []
             batch_paths = []
             batch_indices = []
+            batch_dataset_key = None
+            batch_last_raw_index = None
             temp_paths = []
 
-            if resume_from_index > 0:
+            if resume_from_index > 0 and not use_cursor_resume:
                 _log_progress(f"Skipping first {resume_from_index} items...")
 
             _log_progress("Starting streaming parquet generation...")
@@ -850,6 +1245,7 @@ def main() -> None:
 
             def _flush_batch(is_final: bool = False):
                 nonlocal batch_count, skipped_oom, total_yielded, pending_next_index, next_part
+                nonlocal pending_cursor, batch_dataset_key, batch_last_raw_index
                 if not batch_items:
                     return
                 batch_count += 1
@@ -893,6 +1289,12 @@ def main() -> None:
 
                 if batch_last_index is not None:
                     pending_next_index = max(pending_next_index, batch_last_index + 1)
+                if batch_dataset_key is not None and batch_last_raw_index is not None:
+                    pending_cursor = {
+                        "name": batch_dataset_key[0],
+                        "split": batch_dataset_key[1],
+                        "raw_index": int(batch_last_raw_index + 1),
+                    }
 
                 _log_progress(f"Batch {batch_count} done. Total rows: {total_yielded}")
 
@@ -905,18 +1307,32 @@ def main() -> None:
                 temp_paths.clear()
 
                 if output_mode == "dataset":
-                    _persist_state(pending_next_index, total_yielded, next_part)
+                    _persist_state(pending_next_index, total_yielded, next_part, cursor=pending_cursor)
 
-            for global_index, item in item_iter_with_index():
+            for global_index, dataset_name, dataset_split, raw_index, item in item_iter_with_index(
+                resume_cursor=resume_cursor if use_cursor_resume else None,
+                resume_from_index=resume_from_index,
+                use_streaming=use_streaming,
+            ):
                 last_seen_index = global_index
-                if global_index < resume_from_index:
+                last_seen_dataset_key = (dataset_name, dataset_split)
+                last_seen_raw_index = raw_index
+                if not use_cursor_resume and global_index < resume_from_index:
                     skipped_for_resume += 1
                     if skipped_for_resume % 1000 == 0:
                         _log_progress(f"  Skipped {skipped_for_resume} items...")
                     continue
 
-                if skipped_for_resume > 0 and global_index == resume_from_index:
+                if not use_cursor_resume and skipped_for_resume > 0 and global_index == resume_from_index:
                     _log_progress(f"Resuming from index {global_index} (skipped {skipped_for_resume} items)")
+
+                dataset_key = (dataset_name, dataset_split)
+                if batch_dataset_key is None:
+                    batch_dataset_key = dataset_key
+                elif dataset_key != batch_dataset_key:
+                    _flush_batch()
+                    batch_dataset_key = dataset_key
+                    batch_last_raw_index = None
 
                 audio_value = item.get("audio")
                 if not isinstance(audio_value, dict):
@@ -937,6 +1353,7 @@ def main() -> None:
                 batch_items.append(item)
                 batch_paths.append(encode_path)
                 batch_indices.append(global_index)
+                batch_last_raw_index = raw_index
 
                 if len(batch_items) >= args.batch_size:
                     _flush_batch()
@@ -946,6 +1363,12 @@ def main() -> None:
 
             if last_seen_index >= 0:
                 pending_next_index = max(pending_next_index, last_seen_index + 1)
+            if last_seen_dataset_key is not None and last_seen_raw_index is not None:
+                pending_cursor = {
+                    "name": last_seen_dataset_key[0],
+                    "split": last_seen_dataset_key[1],
+                    "raw_index": int(last_seen_raw_index + 1),
+                }
 
             if output_mode == "dataset":
                 if batch_count == 0 and total_yielded == existing_rows:
@@ -974,9 +1397,9 @@ def main() -> None:
                 tmp_dir.cleanup()
 
         if output_mode == "file" and completed_ok:
-            _persist_state(pending_next_index, total_yielded, 0)
+            _persist_state(pending_next_index, total_yielded, 0, cursor=pending_cursor)
         elif output_mode == "dataset" and total_yielded == existing_rows and not batch_count:
-            _persist_state(pending_next_index, total_yielded, next_part)
+            _persist_state(pending_next_index, total_yielded, next_part, cursor=pending_cursor)
 
         if output_mode == "dataset" and completed_ok and merge_output_path:
             part_files, _ = _scan_parquet_dir(output_dir)

@@ -1,14 +1,15 @@
 import argparse
-import inspect
 import os
 import shutil
 import sys
 
-from datasets import load_dataset
 from huggingface_hub import upload_folder
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 DEFAULT_MAX_SHARD_GB = 4.5
+DEFAULT_BATCH_ROWS = 65536
 
 
 def _ensure_empty_dir(path, overwrite):
@@ -20,16 +21,57 @@ def _ensure_empty_dir(path, overwrite):
     os.makedirs(path, exist_ok=True)
 
 
-def _to_parquet(ds, output_dir, split, max_shard_bytes, overwrite):
+def _stream_shard_parquet(
+    input_path,
+    output_dir,
+    split,
+    max_shard_bytes,
+    batch_rows,
+):
     os.makedirs(output_dir, exist_ok=True)
-    target = os.path.join(output_dir, f"{split}.parquet")
-    kwargs = {}
-    sig = inspect.signature(ds.to_parquet)
-    if "max_shard_size" in sig.parameters:
-        kwargs["max_shard_size"] = max_shard_bytes
-    if "overwrite" in sig.parameters:
-        kwargs["overwrite"] = overwrite
-    ds.to_parquet(target, **kwargs)
+    parquet_file = pq.ParquetFile(input_path)
+    schema = parquet_file.schema_arrow
+
+    shard_paths = []
+    shard_index = 0
+    writer = None
+    current_path = None
+    wrote_any = False
+
+    def _open_writer():
+        nonlocal shard_index, writer, current_path
+        current_path = os.path.join(output_dir, f"{split}-{shard_index:05d}.parquet")
+        writer = pq.ParquetWriter(current_path, schema)
+        shard_paths.append(current_path)
+        shard_index += 1
+
+    for batch in parquet_file.iter_batches(batch_size=batch_rows):
+        if writer is None:
+            _open_writer()
+        table = pa.Table.from_batches([batch], schema=schema)
+        writer.write_table(table)
+        wrote_any = True
+        if os.path.getsize(current_path) >= max_shard_bytes:
+            writer.close()
+            writer = None
+            current_path = None
+
+    if writer is not None:
+        writer.close()
+    if not wrote_any:
+        empty = pa.Table.from_arrays([], schema=schema)
+        _open_writer()
+        writer.write_table(empty)
+        writer.close()
+
+    total = len(shard_paths)
+    renamed = []
+    for idx, path in enumerate(shard_paths):
+        new_name = f"{split}-{idx:05d}-of-{total:05d}.parquet"
+        new_path = os.path.join(output_dir, new_name)
+        os.replace(path, new_path)
+        renamed.append(new_path)
+    return renamed
 
 
 def _parse_args():
@@ -56,6 +98,12 @@ def _parse_args():
         type=float,
         default=DEFAULT_MAX_SHARD_GB,
         help="Shard size in GB (binary GiB).",
+    )
+    parser.add_argument(
+        "--batch-rows",
+        type=int,
+        default=DEFAULT_BATCH_ROWS,
+        help="Rows per batch when streaming (lower if you still OOM).",
     )
     parser.add_argument(
         "--overwrite",
@@ -110,10 +158,15 @@ def main():
     _ensure_empty_dir(args.output_dir, args.overwrite)
     max_shard_bytes = int(args.max_shard_size_gb * (1024 ** 3))
 
-    print("loading parquet...")
-    ds = load_dataset("parquet", data_files=input_path, split="train")
-    print("writing shards...")
-    _to_parquet(ds, args.output_dir, args.split, max_shard_bytes, args.overwrite)
+    print("streaming parquet and writing shards...")
+    shard_paths = _stream_shard_parquet(
+        input_path=input_path,
+        output_dir=args.output_dir,
+        split=args.split,
+        max_shard_bytes=max_shard_bytes,
+        batch_rows=args.batch_rows,
+    )
+    print(f"wrote {len(shard_paths)} shards")
 
     if args.repo_id:
         print("uploading shards...")

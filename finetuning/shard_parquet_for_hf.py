@@ -21,6 +21,30 @@ def _ensure_empty_dir(path, overwrite):
     os.makedirs(path, exist_ok=True)
 
 
+def _iter_tables(parquet_file, batch_rows):
+    schema = parquet_file.schema_arrow
+    try:
+        batch_iter = parquet_file.iter_batches(batch_size=batch_rows, use_threads=False)
+        first_batch = next(batch_iter)
+    except StopIteration:
+        return
+    except pa.ArrowNotImplementedError as exc:
+        print(
+            f"iter_batches failed ({exc}); falling back to row-group reader",
+            file=sys.stderr,
+        )
+    else:
+        yield pa.Table.from_batches([first_batch], schema=schema)
+        for batch in batch_iter:
+            yield pa.Table.from_batches([batch], schema=schema)
+        return
+
+    for rg in range(parquet_file.num_row_groups):
+        table = parquet_file.read_row_group(rg)
+        for offset in range(0, table.num_rows, batch_rows):
+            yield table.slice(offset, batch_rows)
+
+
 def _stream_shard_parquet(
     input_path,
     output_dir,
@@ -45,10 +69,9 @@ def _stream_shard_parquet(
         shard_paths.append(current_path)
         shard_index += 1
 
-    for batch in parquet_file.iter_batches(batch_size=batch_rows):
+    for table in _iter_tables(parquet_file, batch_rows):
         if writer is None:
             _open_writer()
-        table = pa.Table.from_batches([batch], schema=schema)
         writer.write_table(table)
         wrote_any = True
         if os.path.getsize(current_path) >= max_shard_bytes:

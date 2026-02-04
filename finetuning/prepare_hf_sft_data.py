@@ -534,17 +534,62 @@ def _build_output_row(item: Dict, audio_codes, schema: str) -> Dict:
     return out
 
 
-def _download_url(url: str, out_path: str) -> Optional[str]:
-    try:
-        if os.path.exists(out_path):
-            return out_path
-        _ensure_dir(os.path.dirname(out_path))
-        with urllib.request.urlopen(url) as response, open(out_path, "wb") as f:
-            f.write(response.read())
-        return out_path
-    except Exception as exc:
-        print(f"[warn] failed to download: {url} ({exc})", file=sys.stderr)
+def _download_url(
+    url: str,
+    out_path: str,
+    timeout: float,
+    retries: int,
+    backoff: float,
+    chunk_size: int,
+    user_agent: Optional[str] = None,
+) -> Optional[str]:
+    if not url or not out_path:
         return None
+    if os.path.exists(out_path):
+        try:
+            if os.path.getsize(out_path) > 0:
+                return out_path
+        except Exception:
+            pass
+        try:
+            os.remove(out_path)
+        except Exception:
+            pass
+
+    _ensure_dir(os.path.dirname(out_path))
+    tmp_path = f"{out_path}.tmp"
+    attempt = 0
+    while attempt < max(1, retries):
+        attempt += 1
+        try:
+            headers = {}
+            if user_agent:
+                headers["User-Agent"] = user_agent
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as response, open(tmp_path, "wb") as f:
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            os.replace(tmp_path, out_path)
+            return out_path
+        except Exception as exc:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            if attempt >= max(1, retries):
+                _log_progress(f"[warn] failed to download: {url} ({exc})")
+                return None
+            sleep_s = max(0.0, backoff) * (2 ** (attempt - 1))
+            _log_progress(
+                f"[warn] download failed (attempt {attempt}/{retries}) for {url}: {exc}. "
+                f"Retrying in {sleep_s:.1f}s"
+            )
+            time.sleep(sleep_s)
+    return None
 
 
 def _iter_simon_dataset(
@@ -652,6 +697,11 @@ def _iter_arknights_dataset(
     download_audio: bool,
     max_rows: Optional[int],
     start_index: int = 0,
+    download_timeout: float = 30.0,
+    download_retries: int = 3,
+    download_backoff: float = 1.5,
+    download_chunk_size: int = 1024 * 1024,
+    download_user_agent: Optional[str] = "Mozilla/5.0",
 ) -> Iterable[Tuple[int, Dict]]:
     _log_progress(f"Loading dataset: {dataset_name} (split={split}, start_index={start_index})")
     base_index = 0
@@ -677,6 +727,7 @@ def _iter_arknights_dataset(
     _log_progress(f"[arknights] Total rows in dataset: {total_rows}")
     yielded = 0
     skipped = 0
+    download_failures = 0
     if manual_skip:
         _log_progress(f"[arknights] Falling back to manual skip for start_index={start_index}")
     enum_start = base_index if base_index > 0 and not manual_skip else 0
@@ -703,8 +754,17 @@ def _iter_arknights_dataset(
             parsed = urllib.parse.urlparse(file_url)
             basename = os.path.basename(parsed.path) or f"arknights_{idx}.wav"
             out_path = os.path.join(audio_dir, "arknights", f"{idx}_{basename}")
-            downloaded = _download_url(file_url, out_path)
+            downloaded = _download_url(
+                file_url,
+                out_path,
+                timeout=download_timeout,
+                retries=download_retries,
+                backoff=download_backoff,
+                chunk_size=download_chunk_size,
+                user_agent=download_user_agent,
+            )
             if not downloaded:
+                download_failures += 1
                 skipped += 1
                 continue
             audio_path = downloaded
@@ -727,6 +787,8 @@ def _iter_arknights_dataset(
         if yielded % 500 == 0:
             _log_progress(f"[arknights] Yielded {yielded} / processed {idx+1}/{total_rows} (skipped {skipped})")
         yield idx, item
+    if download_failures:
+        _log_progress(f"[arknights] Download failures: {download_failures}")
     _log_progress(f"[arknights] Finished. Total yielded: {yielded}, skipped: {skipped}")
 
 
@@ -780,6 +842,24 @@ def main() -> None:
         help="Flush current batch if next sample is this multiple longer than current max length.",
     )
     parser.add_argument("--no_arknights_download", action="store_true")
+    parser.add_argument(
+        "--arknights_download_timeout",
+        type=float,
+        default=30.0,
+        help="Timeout in seconds for each arknights audio download request.",
+    )
+    parser.add_argument(
+        "--arknights_download_retries",
+        type=int,
+        default=3,
+        help="Number of retries for arknights audio downloads.",
+    )
+    parser.add_argument(
+        "--arknights_download_backoff",
+        type=float,
+        default=1.5,
+        help="Backoff base (seconds) between arknights download retries.",
+    )
     parser.add_argument("--genshin_split", type=str, default="train")
     parser.add_argument("--starrail_split", type=str, default="train")
     parser.add_argument("--arknights_split", type=str, default="train")
@@ -819,6 +899,12 @@ def main() -> None:
     _log_progress(f"  Simon streaming: {not args.no_streaming}")
     _log_progress(f"  Max audio seconds: {args.max_audio_seconds}")
     _log_progress(f"  Max length ratio: {args.max_length_ratio}")
+    _log_progress(
+        "  Arknights download: "
+        f"timeout={args.arknights_download_timeout}s "
+        f"retries={args.arknights_download_retries} "
+        f"backoff={args.arknights_download_backoff}s"
+    )
     _log_progress(f"  Resume search tail rows: {args.resume_search_tail_rows}")
     _log_progress(f"  Resume search sequence: {args.resume_search_sequence}")
     _log_progress("=" * 50)
@@ -912,6 +998,9 @@ def main() -> None:
             not args.no_arknights_download,
             args.max_per_dataset,
             start_index=start_index,
+            download_timeout=args.arknights_download_timeout,
+            download_retries=args.arknights_download_retries,
+            download_backoff=args.arknights_download_backoff,
         ):
             yield global_index, arknights_name, arknights_split, raw_index, item
             global_index += 1

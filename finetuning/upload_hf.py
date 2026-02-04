@@ -11,7 +11,7 @@ README_NAME = "README_CHUNKS.txt"
 DEFAULT_CHUNK_GB = 4.5
 
 
-def _iter_files(root_dir):
+def _iter_files(root_dir, include_relpaths=None):
     for dirpath, dirnames, filenames in os.walk(root_dir):
         dirnames[:] = [
             name for name in dirnames if name not in {".git", ".hg", ".svn", "__pycache__"}
@@ -21,6 +21,10 @@ def _iter_files(root_dir):
             if os.path.islink(path):
                 print(f"skip symlink: {path}", file=sys.stderr)
                 continue
+            if include_relpaths is not None:
+                rel = _normalize_relpath(root_dir, path)
+                if rel not in include_relpaths:
+                    continue
             yield path
 
 
@@ -102,12 +106,27 @@ def _normalize_relpath(root_dir, file_path):
     return rel.replace(os.sep, "/")
 
 
-def _validate_dirs(output_dir, staging_dir, in_place):
-    if not os.path.isdir(output_dir):
-        raise RuntimeError(f"output_dir not found: {output_dir}")
+def _resolve_target(output_dir):
+    if os.path.isfile(output_dir):
+        root_dir = os.path.dirname(output_dir) or "."
+        include_rel = _normalize_relpath(root_dir, output_dir)
+        return root_dir, {include_rel}
+    if os.path.isdir(output_dir):
+        return output_dir, None
+    raise RuntimeError(f"output_dir not found: {output_dir}")
+
+
+def _default_staging_dir(root_dir):
+    root_abs = os.path.abspath(root_dir)
+    parent = os.path.dirname(root_abs)
+    base = os.path.basename(root_abs.rstrip(os.sep)) or "upload_root"
+    return os.path.join(parent, f"{base}_hf_chunks")
+
+
+def _validate_dirs(root_dir, staging_dir, in_place):
     if in_place:
         return
-    output_real = os.path.realpath(output_dir)
+    output_real = os.path.realpath(root_dir)
     staging_real = os.path.realpath(staging_dir)
     if os.path.commonpath([output_real, staging_real]) == output_real:
         raise RuntimeError("staging_dir cannot be inside output_dir")
@@ -121,9 +140,10 @@ def _prepare_staging(
     overwrite_chunks,
     remove_original,
     write_readme,
+    include_relpaths,
 ):
     _ensure_empty_dir(staging_dir, overwrite_staging)
-    for src_path in _iter_files(output_dir):
+    for src_path in _iter_files(output_dir, include_relpaths):
         rel = os.path.relpath(src_path, output_dir)
         dest_base = os.path.join(staging_dir, rel)
         size = os.path.getsize(src_path)
@@ -144,9 +164,10 @@ def _prepare_in_place(
     overwrite_chunks,
     remove_original,
     write_readme,
+    include_relpaths,
 ):
     ignore_patterns = []
-    for src_path in _iter_files(output_dir):
+    for src_path in _iter_files(output_dir, include_relpaths):
         size = os.path.getsize(src_path)
         if size > chunk_bytes:
             rel = _normalize_relpath(output_dir, src_path)
@@ -165,7 +186,11 @@ def _parse_args():
     parser = argparse.ArgumentParser(
         description="Chunk large files and upload a folder to the Hugging Face Hub."
     )
-    parser.add_argument("--output-dir", required=True, help="Local folder to upload.")
+    parser.add_argument(
+        "--output-dir",
+        required=True,
+        help="Local folder to upload (or a single file path).",
+    )
     parser.add_argument("--repo-id", required=True, help="Target repo, e.g. org/name.")
     parser.add_argument("--path-in-repo", default="data", help="Repo subfolder.")
     parser.add_argument("--repo-type", default="dataset", help="dataset or model.")
@@ -227,30 +252,33 @@ def _parse_args():
 def main():
     args = _parse_args()
     chunk_bytes = int(args.chunk_size_gb * (1024 ** 3))
-    staging_dir = args.staging_dir or f"{args.output_dir.rstrip(os.sep)}_hf_chunks"
-    _validate_dirs(args.output_dir, staging_dir, args.in_place)
+    output_root, include_relpaths = _resolve_target(args.output_dir)
+    staging_dir = args.staging_dir or _default_staging_dir(output_root)
+    _validate_dirs(output_root, staging_dir, args.in_place)
 
     ignore_patterns = ["**/.git/**", "**/__pycache__/**"]
     if args.in_place:
         ignore_patterns.extend(
             _prepare_in_place(
-                output_dir=args.output_dir,
+                output_dir=output_root,
                 chunk_bytes=chunk_bytes,
                 overwrite_chunks=args.overwrite_chunks,
                 remove_original=args.remove_original,
                 write_readme=not args.no_readme,
+                include_relpaths=include_relpaths,
             )
         )
-        upload_root = args.output_dir
+        upload_root = output_root
     else:
         _prepare_staging(
-            output_dir=args.output_dir,
+            output_dir=output_root,
             staging_dir=staging_dir,
             chunk_bytes=chunk_bytes,
             overwrite_staging=args.overwrite_staging,
             overwrite_chunks=args.overwrite_chunks,
             remove_original=args.remove_original,
             write_readme=not args.no_readme,
+            include_relpaths=include_relpaths,
         )
         upload_root = staging_dir
 

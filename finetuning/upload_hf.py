@@ -2,19 +2,19 @@ from huggingface_hub import upload_folder, login
 import pyarrow.parquet as pq
 from pathlib import Path
 
-# Split parquet into chunks
+# Split parquet into chunks (streaming to avoid OOM)
 input_path = Path("./sft_dataset/merged.parquet")
 output_dir = Path("./sft_dataset/chunks")
 output_dir.mkdir(parents=True, exist_ok=True)
 
-table = pq.read_table(input_path)
-chunk_size = 100_000  # rows per chunk
+parquet_file = pq.ParquetFile(input_path)
+chunk_size = 100_000  # rows per batch
 
-for i, start in enumerate(range(0, len(table), chunk_size)):
-    chunk = table.slice(start, chunk_size)
-    pq.write_table(chunk, output_dir / f"part_{i:04d}.parquet")
+for i, batch in enumerate(parquet_file.iter_batches(batch_size=chunk_size)):
+    pq.write_table(pq.Table.from_batches([batch]), output_dir / f"part_{i:04d}.parquet")
+    print(f"Wrote chunk {i}")
 
-print(f"Split into {(len(table) + chunk_size - 1) // chunk_size} chunks")
+print(f"Split complete")
 
 # Upload folder
 upload_folder(

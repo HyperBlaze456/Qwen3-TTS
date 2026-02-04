@@ -149,12 +149,6 @@ def _parse_args():
         help="dataset or model.",
     )
     parser.add_argument(
-        "--max-workers",
-        type=int,
-        default=4,
-        help="Max parallel workers for upload_folder.",
-    )
-    parser.add_argument(
         "--commit-message",
         default="Upload parquet shards",
         help="Commit message for the Hub.",
@@ -199,7 +193,6 @@ def main():
             "repo_id": args.repo_id,
             "repo_type": args.repo_type,
             "commit_message": args.commit_message,
-            "max_workers": args.max_workers,
         }
         if args.token:
             kwargs["token"] = args.token

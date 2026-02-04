@@ -65,7 +65,24 @@ def _is_cuda_oom(exc: BaseException) -> bool:
     if isinstance(exc, oom_type):
         return True
     msg = str(exc).lower()
-    return "cuda out of memory" in msg
+    if "out of memory" in msg and any(token in msg for token in ("cuda", "cublas", "cudnn", "hip", "mps")):
+        return True
+    if "cublas_status_alloc_failed" in msg or "cudnn_status_alloc_failed" in msg:
+        return True
+    return False
+
+
+def _release_exception(exc: BaseException) -> None:
+    """Clear traceback references to help free GPU memory after OOM."""
+    try:
+        tb = exc.__traceback__
+        if tb is not None:
+            traceback.clear_frames(tb)
+        exc.__traceback__ = None
+        exc.__context__ = None
+        exc.__cause__ = None
+    except Exception:
+        pass
 
 
 def _clear_cuda_cache() -> None:
@@ -643,7 +660,15 @@ def main() -> None:
                 gc.collect()
                 _clear_cuda_cache()
 
-                if not _is_cuda_oom(exc):
+                is_oom = _is_cuda_oom(exc)
+                if is_oom:
+                    # Clear exception traceback to avoid holding GPU tensors alive during retry.
+                    _release_exception(exc)
+                    exc = None
+                    gc.collect()
+                    _clear_cuda_cache()
+
+                if not is_oom:
                     raise
                 _log_progress(
                     f"[warn] CUDA OOM in batch {batch_idx} (size={len(chunk_items)}, depth={depth}). "

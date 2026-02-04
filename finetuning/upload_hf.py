@@ -2,9 +2,6 @@ from huggingface_hub import upload_folder, login
 import pyarrow.parquet as pq
 from pathlib import Path
 
-# (optional) Login with your Hugging Face credentials
-login()
-
 # Split parquet into chunks
 input_path = Path("./sft_dataset/merged.parquet")
 output_dir = Path("./sft_dataset/chunks")

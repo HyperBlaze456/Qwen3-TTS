@@ -2,15 +2,15 @@
 
 Usage:
     python finetuning/add_audio_codes.py \
-        --input_parquet data/existing.parquet \
-        --output_parquet data/with_codes.parquet \
-        --batch_size 4
+        --input_parquet dataset/ \
+        --output_parquet with_codes.parquet \
+        --batch_size 32
 """
 
 import argparse
 import gc
+import io
 import os
-import re
 import sys
 import tempfile
 import time
@@ -19,7 +19,6 @@ import torch
 
 from prepare_hf_sft_data import (
     BATCH_INFER_NUM,
-    PART_RE,
     _clear_cuda_cache,
     _disable_model_cache,
     _ensure_dir,
@@ -29,9 +28,7 @@ from prepare_hf_sft_data import (
     _load_json,
     _log_progress,
     _release_exception,
-    _scan_parquet_dir,
     _write_json_atomic,
-    _write_temp_audio,
 )
 
 
@@ -65,14 +62,29 @@ def _iter_input_rows(input_paths, skip_rows=0):
                 global_idx += 1
 
 
-def _encode_batch_with_fallback(tokenizer, batch_rows, batch_paths, batch_idx):
-    """Encode a batch of audio paths, splitting on OOM."""
+def _decode_audio_bytes(audio_bytes, target_sr):
+    """Decode raw audio bytes to a resampled numpy array in memory."""
+    import librosa
+    import numpy as np
+    import soundfile as sf
 
-    def _encode_chunk(chunk_rows, chunk_paths, depth):
+    buf = io.BytesIO(audio_bytes)
+    audio, sr = sf.read(buf, dtype="float32", always_2d=False)
+    if audio.ndim > 1:
+        audio = np.mean(audio, axis=-1)
+    if sr != target_sr:
+        audio = librosa.resample(y=audio.astype(np.float32), orig_sr=sr, target_sr=target_sr)
+    return audio.astype(np.float32)
+
+
+def _encode_batch_with_fallback(tokenizer, batch_rows, batch_wavs, target_sr, batch_idx):
+    """Encode a batch of numpy waveforms, splitting on OOM."""
+
+    def _encode_chunk(chunk_rows, chunk_wavs, depth):
         enc = None
         try:
             with torch.no_grad():
-                enc = tokenizer.encode(chunk_paths)
+                enc = tokenizer.encode(chunk_wavs, sr=target_sr)
                 codes = []
                 for i in range(len(enc.audio_codes)):
                     codes.append(enc.audio_codes[i].contiguous().cpu().tolist())
@@ -110,16 +122,16 @@ def _encode_batch_with_fallback(tokenizer, batch_rows, batch_paths, batch_idx):
                 "Splitting batch to reduce max sequence length."
             )
             if len(chunk_rows) == 1:
-                _log_progress(f"[warn] Skipping sample due to CUDA OOM: {chunk_paths[0]}")
+                _log_progress(f"[warn] Skipping 1 sample due to CUDA OOM.")
                 return []
             mid = len(chunk_rows) // 2
-            left = _encode_chunk(chunk_rows[:mid], chunk_paths[:mid], depth + 1)
+            left = _encode_chunk(chunk_rows[:mid], chunk_wavs[:mid], depth + 1)
             gc.collect()
             _clear_cuda_cache()
-            right = _encode_chunk(chunk_rows[mid:], chunk_paths[mid:], depth + 1)
+            right = _encode_chunk(chunk_rows[mid:], chunk_wavs[mid:], depth + 1)
             return left + right
 
-    return _encode_chunk(batch_rows, batch_paths, 0)
+    return _encode_chunk(batch_rows, batch_wavs, 0)
 
 
 def _resolve_output_mode(output_path, output_mode):
@@ -261,7 +273,7 @@ def main():
         raise SystemExit("Missing dependency: pyarrow.") from exc
 
     # --- Processing ---
-    tmp_dir = tempfile.TemporaryDirectory()
+    target_sr = int(tokenizer.feature_extractor.sampling_rate)
     writer = None
     tmp_output_file = None
     existing_schema = None
@@ -271,8 +283,7 @@ def main():
     completed_ok = False
 
     batch_rows = []
-    batch_paths = []
-    temp_paths = []
+    batch_wavs = []
 
     def _persist_state():
         _write_json_atomic(state_path, {
@@ -313,7 +324,7 @@ def main():
             f"{batch_count} ({len(batch_rows)} samples)..."
         )
         encoded_pairs = _encode_batch_with_fallback(
-            tokenizer, batch_rows, batch_paths, batch_count
+            tokenizer, batch_rows, batch_wavs, target_sr, batch_count
         )
         skipped_oom += len(batch_rows) - len(encoded_pairs)
         out_rows = []
@@ -324,7 +335,7 @@ def main():
         del encoded_pairs
 
         batch_rows.clear()
-        batch_paths.clear()
+        batch_wavs.clear()
 
         if out_rows:
             table = _build_table(out_rows)
@@ -347,13 +358,6 @@ def main():
         _log_progress(f"Batch {batch_count} done. Output rows: {output_rows_written}")
 
         gc.collect()
-        for p in temp_paths:
-            try:
-                os.remove(p)
-            except Exception:
-                pass
-        temp_paths.clear()
-
         if output_mode == "dataset":
             _persist_state()
 
@@ -378,13 +382,17 @@ def main():
                 rows_completed = global_idx + 1
                 continue
 
-            # Write to temp file for tokenizer
-            path_hint = audio_value.get("path")
-            encode_path = _write_temp_audio(audio_bytes, path_hint, tmp_dir.name)
-            temp_paths.append(encode_path)
+            # Decode audio bytes to numpy in memory (no temp files)
+            try:
+                wav = _decode_audio_bytes(audio_bytes, target_sr)
+            except Exception as exc:
+                _log_progress(f"[warn] Row {global_idx}: failed to decode audio: {exc}")
+                skipped_no_audio += 1
+                rows_completed = global_idx + 1
+                continue
 
             batch_rows.append(row)
-            batch_paths.append(encode_path)
+            batch_wavs.append(wav)
 
             if len(batch_rows) >= args.batch_size:
                 _flush_batch()
@@ -396,19 +404,16 @@ def main():
 
         completed_ok = True
     finally:
-        try:
-            if writer is not None:
-                writer.close()
-                if tmp_output_file:
-                    if completed_ok:
-                        os.replace(tmp_output_file, output_path)
-                    else:
-                        try:
-                            os.remove(tmp_output_file)
-                        except Exception:
-                            pass
-        finally:
-            tmp_dir.cleanup()
+        if writer is not None:
+            writer.close()
+            if tmp_output_file:
+                if completed_ok:
+                    os.replace(tmp_output_file, output_path)
+                else:
+                    try:
+                        os.remove(tmp_output_file)
+                    except Exception:
+                        pass
 
     _persist_state()
 

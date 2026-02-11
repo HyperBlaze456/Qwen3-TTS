@@ -5,7 +5,7 @@ import pandas as pd
 
 
 def main():
-    data_dir = Path("./data")
+    data_dir = Path("./dataset")
 
     if not data_dir.exists():
         print(f"Error: {data_dir} directory not found")

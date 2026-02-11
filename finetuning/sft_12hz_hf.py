@@ -103,16 +103,22 @@ def train():
 
     # Speaker configuration
     parser.add_argument(
+        "--bake_speaker",
+        action="store_true",
+        help="Bake a single speaker embedding into the model (custom_voice mode). "
+        "If not set, keeps the model as base type with speaker_encoder for reference audio.",
+    )
+    parser.add_argument(
         "--speaker_name",
         type=str,
         default="speaker_test",
-        help="Name for the fine-tuned speaker voice.",
+        help="Name for the fine-tuned speaker voice (only used with --bake_speaker).",
     )
     parser.add_argument(
         "--speaker_id",
         type=int,
         default=3000,
-        help="Speaker ID slot to use in the embedding table.",
+        help="Speaker ID slot to use in the embedding table (only used with --bake_speaker).",
     )
 
     # Logging
@@ -142,7 +148,10 @@ def train():
     accelerator.print("=" * 60)
     accelerator.print(f"  Base model: {args.init_model_path}")
     accelerator.print(f"  Dataset: {args.hf_dataset} (split={args.hf_split})")
-    accelerator.print(f"  Speaker name: {args.speaker_name} (id={args.speaker_id})")
+    if args.bake_speaker:
+        accelerator.print(f"  Mode: custom_voice (bake speaker={args.speaker_name}, id={args.speaker_id})")
+    else:
+        accelerator.print("  Mode: base (keep speaker_encoder, use reference audio at inference)")
     accelerator.print(f"  Batch size: {args.batch_size}")
     accelerator.print(f"  Learning rate: {args.lr}")
     accelerator.print(f"  Epochs: {args.num_epochs}")
@@ -309,36 +318,43 @@ def train():
 
             shutil.copytree(MODEL_PATH, output_dir, dirs_exist_ok=True)
 
-            # Update config for custom voice
-            input_config_file = os.path.join(MODEL_PATH, "config.json")
-            output_config_file = os.path.join(output_dir, "config.json")
-            with open(input_config_file, "r", encoding="utf-8") as f:
-                config_dict = json.load(f)
-
-            config_dict["tts_model_type"] = "custom_voice"
-            talker_config = config_dict.get("talker_config", {})
-            talker_config["spk_id"] = {args.speaker_name: args.speaker_id}
-            talker_config["spk_is_dialect"] = {args.speaker_name: False}
-            config_dict["talker_config"] = talker_config
-
-            with open(output_config_file, "w", encoding="utf-8") as f:
-                json.dump(config_dict, f, indent=2, ensure_ascii=False)
-
             # Save model weights
             unwrapped_model = accelerator.unwrap_model(model)
             state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
 
-            # Drop speaker encoder weights (not needed for inference)
-            drop_prefix = "speaker_encoder"
-            keys_to_drop = [k for k in state_dict.keys() if k.startswith(drop_prefix)]
-            for k in keys_to_drop:
-                del state_dict[k]
+            if args.bake_speaker:
+                # Custom voice mode: bake a single speaker embedding into the model
+                input_config_file = os.path.join(MODEL_PATH, "config.json")
+                output_config_file = os.path.join(output_dir, "config.json")
+                with open(input_config_file, "r", encoding="utf-8") as f:
+                    config_dict = json.load(f)
 
-            # Inject speaker embedding into codec embedding table
-            weight = state_dict["talker.model.codec_embedding.weight"]
-            state_dict["talker.model.codec_embedding.weight"][args.speaker_id] = (
-                target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
-            )
+                config_dict["tts_model_type"] = "custom_voice"
+                talker_config = config_dict.get("talker_config", {})
+                talker_config["spk_id"] = {args.speaker_name: args.speaker_id}
+                talker_config["spk_is_dialect"] = {args.speaker_name: False}
+                config_dict["talker_config"] = talker_config
+
+                with open(output_config_file, "w", encoding="utf-8") as f:
+                    json.dump(config_dict, f, indent=2, ensure_ascii=False)
+
+                # Drop speaker encoder weights (not needed for custom voice inference)
+                drop_prefix = "speaker_encoder"
+                keys_to_drop = [k for k in state_dict.keys() if k.startswith(drop_prefix)]
+                for k in keys_to_drop:
+                    del state_dict[k]
+
+                # Inject speaker embedding into codec embedding table
+                if target_speaker_embedding is not None:
+                    weight = state_dict["talker.model.codec_embedding.weight"]
+                    state_dict["talker.model.codec_embedding.weight"][args.speaker_id] = (
+                        target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
+                    )
+                accelerator.print(f"  Mode: custom_voice (speaker={args.speaker_name})")
+            else:
+                # Base model mode: keep speaker_encoder, no speaker baking
+                # Model will use reference audio at inference time
+                accelerator.print("  Mode: base (reference audio at inference)")
 
             save_path = os.path.join(output_dir, "model.safetensors")
             save_file(state_dict, save_path)
